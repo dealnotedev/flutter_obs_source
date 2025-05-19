@@ -217,7 +217,7 @@ DWORD WINAPI flutter_engine_thread_proc(LPVOID param)
 			uint64_t now = (uint64_t)GetTickCount64() * 1000000ull;
 			if (target_time > now)
 				Sleep((DWORD)((target_time - now) / 1000000ull));
-			FlutterEngineRunTask(NULL, &task);
+			FlutterEngineRunTask(context->engine, &task);
 
 			blog(LOG_INFO, "[FlutterSource] Task Executed");
 		}
