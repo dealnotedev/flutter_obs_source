@@ -1,6 +1,4 @@
 /*
- * flutter_source_custom_task_runners.c
- * -----------------------------------
  * OBS Studio source plug‑in that embeds the Flutter engine on Windows.
  * The engine runs on a dedicated worker thread and communicates with OBS
  * via a software texture.  A custom platform task‑runner is used so that
