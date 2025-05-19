@@ -41,9 +41,6 @@ static void platform_message_callback(const FlutterPlatformMessage *message, voi
 
 void init_flutter_engine(struct flutter_source *context)
 {
-	context->width = 1280;
-	context->height = 720;
-
 	context->pixel_data = (uint8_t *)malloc(context->width * context->height * 4);
 	memset(context->pixel_data, 0, context->width * context->height * 4);
 
@@ -128,7 +125,13 @@ static const char *flutter_source_get_name(void *unused)
 static void *flutter_source_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct flutter_source *context = bzalloc(sizeof(struct flutter_source));
+
 	context->source = source;
+	context->width = (uint32_t)obs_data_get_int(settings, "width");
+	context->height = (uint32_t)obs_data_get_int(settings, "height");
+
+	if (context->width == 0) context->width = 320;
+	if (context->height == 0) context->height = 240;
 
 	init_flutter_engine(context);
 
@@ -156,7 +159,7 @@ static void flutter_source_destroy(void *data)
 	bfree(context);
 }
 
-static void flutter_source_render(void *data, gs_effect_t *effect)
+static void flutter_source_render(void *data, const gs_effect_t *effect)
 {
 	struct flutter_source *ctx = data;
 
@@ -170,7 +173,7 @@ static void flutter_source_render(void *data, gs_effect_t *effect)
 
 	if (!ctx->texture) return;
 
-	bool previous = gs_framebuffer_srgb_enabled();
+	const bool previous = gs_framebuffer_srgb_enabled();
 	gs_enable_framebuffer_srgb(true);
 
 	gs_blend_state_push();
@@ -184,16 +187,64 @@ static void flutter_source_render(void *data, gs_effect_t *effect)
 	gs_enable_framebuffer_srgb(previous);
 }
 
-static uint32_t flutter_source_get_width(void *data)
+static uint32_t flutter_source_get_width(const void *data)
 {
-	UNUSED_PARAMETER(data);
-	return 1280;
+	const struct flutter_source *ctx = data;
+	return ctx->width;
 }
 
-static uint32_t flutter_source_get_height(void *data)
+static uint32_t flutter_source_get_height(const void *data)
 {
-	UNUSED_PARAMETER(data);
-	return 720;
+	const struct flutter_source *ctx = data;
+	return ctx->height;
+}
+
+static obs_properties_t *flutter_source_properties(void *data)
+{
+	obs_properties_t *props = obs_properties_create();
+	obs_properties_add_int(props, "width", "Width", 320, 3840, 1);
+	obs_properties_add_int(props, "height", "Height", 240, 2160, 1);
+	return props;
+}
+
+static void flutter_source_update(void *data, obs_data_t *settings)
+{
+	struct flutter_source *ctx = data;
+
+	uint32_t new_width  = (uint32_t)obs_data_get_int(settings, "width");
+	uint32_t new_height = (uint32_t)obs_data_get_int(settings, "height");
+
+	if (new_width == 0)  new_width  = 320;
+	if (new_height == 0) new_height = 240;
+
+	if (ctx->width == new_width && ctx->height == new_height)
+		return;
+
+	if (ctx->texture) {
+		gs_texture_destroy(ctx->texture);
+		ctx->texture = NULL;
+	}
+	if (ctx->pixel_data) {
+		free(ctx->pixel_data);
+		ctx->pixel_data = NULL;
+	}
+
+	ctx->width  = new_width;
+	ctx->height = new_height;
+
+	ctx->pixel_data = (uint8_t *)malloc(ctx->width * ctx->height * 4);
+	memset(ctx->pixel_data, 0, ctx->width * ctx->height * 4);
+
+	if (ctx->engine) {
+		FlutterWindowMetricsEvent window_event = {0};
+		window_event.struct_size = sizeof(FlutterWindowMetricsEvent);
+		window_event.width = ctx->width;
+		window_event.height = ctx->height;
+		window_event.pixel_ratio = 1.0f;
+		FlutterEngineSendWindowMetricsEvent(ctx->engine, &window_event);
+
+		FlutterEngineScheduleFrame(ctx->engine);
+	}
 }
 
 struct obs_source_info flutter_source_info = {
@@ -206,5 +257,7 @@ struct obs_source_info flutter_source_info = {
 	.video_render = flutter_source_render,
 	.get_width = flutter_source_get_width,
 	.get_height = flutter_source_get_height,
+	.update = flutter_source_update,
+	.get_properties = flutter_source_properties,
 	.icon_type = OBS_ICON_TYPE_MEDIA
 };
