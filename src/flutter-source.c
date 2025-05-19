@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <windows.h>
+#include <Shlwapi.h>
+#pragma comment(lib, "Shlwapi.lib")
 
 // OBS_DECLARE_MODULE()
 // OBS_MODULE_USE_DEFAULT_LOCALE("plugintemplate-for-obs", "en-US")
@@ -40,10 +42,39 @@ static void platform_message_callback(const FlutterPlatformMessage *message, voi
 	blog(LOG_INFO, "[Flutter] platform_message_callback");
 }
 
+static void get_assets_paths(wchar_t* assets_path, wchar_t* icu_path, wchar_t* aot_path)
+{
+	HMODULE hModule = NULL;
+
+	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			   (LPCWSTR)&get_assets_paths, &hModule);
+
+	wchar_t dll_path[MAX_PATH];
+	GetModuleFileNameW(hModule, dll_path, MAX_PATH);
+
+	PathRemoveFileSpecW(dll_path);
+
+	wchar_t base_folder[MAX_PATH];
+	wsprintfW(base_folder, L"%s\\flutter_template", dll_path);
+
+	wsprintfW(assets_path, L"%s\\flutter_assets", base_folder);
+	wsprintfW(icu_path,    L"%s\\icudtl.dat",    base_folder);
+	wsprintfW(aot_path,    L"%s\\app.so",        base_folder);
+}
+
 void init_flutter_engine(struct flutter_source *context)
 {
 	context->pixel_data = (uint8_t *)malloc(context->width * context->height * 4);
 	memset(context->pixel_data, 0, context->width * context->height * 4);
+
+	wchar_t assets_path_w[MAX_PATH], icu_path_w[MAX_PATH], aot_path_w[MAX_PATH];
+	get_assets_paths(assets_path_w, icu_path_w, aot_path_w);
+
+	// Переводим в char*
+	char assets_path[MAX_PATH], icu_path[MAX_PATH], aot_path[MAX_PATH];
+	WideCharToMultiByte(CP_UTF8, 0, assets_path_w, -1, assets_path, MAX_PATH, NULL, NULL);
+	WideCharToMultiByte(CP_UTF8, 0, icu_path_w,    -1, icu_path,    MAX_PATH, NULL, NULL);
+	WideCharToMultiByte(CP_UTF8, 0, aot_path_w,    -1, aot_path,    MAX_PATH, NULL, NULL);
 
 	FlutterSoftwareRendererConfig software_config = {0};
 	software_config.struct_size = sizeof(FlutterSoftwareRendererConfig);
@@ -58,8 +89,8 @@ void init_flutter_engine(struct flutter_source *context)
 	FlutterProjectArgs project_args = {0};
 	project_args.struct_size = sizeof(FlutterProjectArgs);
 
-	project_args.assets_path = "D:/obstemplate_aot/flutter_assets";
-	project_args.icu_data_path = "D:/obstemplate_aot/icudtl.dat";
+	project_args.assets_path = assets_path;
+	project_args.icu_data_path = icu_path;
 
 	//project_args.vm_snapshot_data = "D:/obstemplate/vm_snapshot_data";
 	//project_args.isolate_snapshot_data = "D:/obstemplate/isolate_snapshot_data";
@@ -80,7 +111,7 @@ void init_flutter_engine(struct flutter_source *context)
 
 	FlutterEngineAOTDataSource aot_source = {
 		.type = kFlutterEngineAOTDataSourceTypeElfPath,
-		.elf_path = "D:/obstemplate_aot/app.so",
+		.elf_path = aot_path,
 	};
 
 	FlutterEngineAOTData aot_data = NULL;
