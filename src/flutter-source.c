@@ -70,7 +70,6 @@ void init_flutter_engine(struct flutter_source *context)
 	wchar_t assets_path_w[MAX_PATH], icu_path_w[MAX_PATH], aot_path_w[MAX_PATH];
 	get_assets_paths(assets_path_w, icu_path_w, aot_path_w);
 
-	// Переводим в char*
 	char assets_path[MAX_PATH], icu_path[MAX_PATH], aot_path[MAX_PATH];
 	WideCharToMultiByte(CP_UTF8, 0, assets_path_w, -1, assets_path, MAX_PATH, NULL, NULL);
 	WideCharToMultiByte(CP_UTF8, 0, icu_path_w,    -1, icu_path,    MAX_PATH, NULL, NULL);
@@ -91,11 +90,6 @@ void init_flutter_engine(struct flutter_source *context)
 
 	project_args.assets_path = assets_path;
 	project_args.icu_data_path = icu_path;
-
-	//project_args.vm_snapshot_data = "D:/obstemplate/vm_snapshot_data";
-	//project_args.isolate_snapshot_data = "D:/obstemplate/isolate_snapshot_data";
-	//project_args.vm_snapshot_instructions       = NULL;
-	//project_args.isolate_snapshot_instructions  = NULL;
 
 	static const char *engine_argv[] = {"obs_flutter", // dummy exe name
 					    "--verbose-logging",
