@@ -23,7 +23,8 @@ static bool my_surface_present_callback(void *user_data, const void *allocation,
 {
 	struct flutter_source *ctx = user_data;
 
-	if (!ctx->pixel_data) return false;
+	if (!ctx->pixel_data)
+		return false;
 	memcpy(ctx->pixel_data, allocation, row_bytes * height);
 	InterlockedExchange(&ctx->dirty_pixels, 1);
 	return true;
@@ -109,7 +110,6 @@ void init_flutter_engine(struct flutter_source *context)
 		window_event.pixel_ratio = 1.0f;
 		FlutterEngineSendWindowMetricsEvent(context->engine, &window_event);
 
-
 		FlutterEngineScheduleFrame(context->engine);
 
 		blog(LOG_INFO, "[FlutterSource] Sent WindowMetricsEvent and ScheduleFrame");
@@ -130,8 +130,13 @@ static void *flutter_source_create(obs_data_t *settings, obs_source_t *source)
 	context->width = (uint32_t)obs_data_get_int(settings, "width");
 	context->height = (uint32_t)obs_data_get_int(settings, "height");
 
-	if (context->width == 0) context->width = 320;
-	if (context->height == 0) context->height = 240;
+	if (context->width == 0)
+		context->width = 320;
+	if (context->height == 0)
+		context->height = 240;
+
+	const DWORD tid = GetCurrentThreadId();
+	blog(LOG_INFO, "[FlutterSource] INIT, thread id: %lu", (unsigned long)tid);
 
 	init_flutter_engine(context);
 
@@ -140,15 +145,27 @@ static void *flutter_source_create(obs_data_t *settings, obs_source_t *source)
 
 static void flutter_source_destroy(void *data)
 {
+	blog(LOG_INFO, "[FlutterSource] DESTROY called");
+
+	const DWORD tid = GetCurrentThreadId();
+	blog(LOG_INFO, "[FlutterSource] DESTROY, thread id: %lu", (unsigned long)tid);
+
 	struct flutter_source *context = data;
 
 	if (context->engine) {
-		FlutterEngineShutdown(context->engine);
+		const FlutterEngineResult res = FlutterEngineShutdown(context->engine);
+		blog(LOG_INFO, "[FlutterSource] FlutterEngineShutdown result: %d", res);
+		context->engine = NULL;
 	}
 
 	if (context->aot_data) {
 		FlutterEngineCollectAOTData(context->aot_data);
 		context->aot_data = NULL;
+	}
+
+	if (context->texture) {
+		gs_texture_destroy(context->texture);
+		context->texture = NULL;
 	}
 
 	if (context->pixel_data) {
@@ -157,6 +174,8 @@ static void flutter_source_destroy(void *data)
 	}
 
 	bfree(context);
+
+	blog(LOG_INFO, "[FlutterSource] DESTROY ended");
 }
 
 static void flutter_source_render(void *data, const gs_effect_t *effect)
@@ -171,7 +190,8 @@ static void flutter_source_render(void *data, const gs_effect_t *effect)
 		gs_texture_set_image(ctx->texture, ctx->pixel_data, ctx->width * 4, false);
 	}
 
-	if (!ctx->texture) return;
+	if (!ctx->texture)
+		return;
 
 	const bool previous = gs_framebuffer_srgb_enabled();
 	gs_enable_framebuffer_srgb(true);
@@ -211,11 +231,13 @@ static void flutter_source_update(void *data, obs_data_t *settings)
 {
 	struct flutter_source *ctx = data;
 
-	uint32_t new_width  = (uint32_t)obs_data_get_int(settings, "width");
+	uint32_t new_width = (uint32_t)obs_data_get_int(settings, "width");
 	uint32_t new_height = (uint32_t)obs_data_get_int(settings, "height");
 
-	if (new_width == 0)  new_width  = 320;
-	if (new_height == 0) new_height = 240;
+	if (new_width == 0)
+		new_width = 320;
+	if (new_height == 0)
+		new_height = 240;
 
 	if (ctx->width == new_width && ctx->height == new_height)
 		return;
@@ -229,7 +251,7 @@ static void flutter_source_update(void *data, obs_data_t *settings)
 		ctx->pixel_data = NULL;
 	}
 
-	ctx->width  = new_width;
+	ctx->width = new_width;
 	ctx->height = new_height;
 
 	ctx->pixel_data = (uint8_t *)malloc(ctx->width * ctx->height * 4);
@@ -247,17 +269,15 @@ static void flutter_source_update(void *data, obs_data_t *settings)
 	}
 }
 
-struct obs_source_info flutter_source_info = {
-	.id = "flutter_source",
-	.type = OBS_SOURCE_TYPE_INPUT,
-	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_SRGB,
-	.get_name = flutter_source_get_name,
-	.create = flutter_source_create,
-	.destroy = flutter_source_destroy,
-	.video_render = flutter_source_render,
-	.get_width = flutter_source_get_width,
-	.get_height = flutter_source_get_height,
-	.update = flutter_source_update,
-	.get_properties = flutter_source_properties,
-	.icon_type = OBS_ICON_TYPE_MEDIA
-};
+struct obs_source_info flutter_source_info = {.id = "flutter_source",
+					      .type = OBS_SOURCE_TYPE_INPUT,
+					      .output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_SRGB,
+					      .get_name = flutter_source_get_name,
+					      .create = flutter_source_create,
+					      .destroy = flutter_source_destroy,
+					      .video_render = flutter_source_render,
+					      .get_width = flutter_source_get_width,
+					      .get_height = flutter_source_get_height,
+					      .update = flutter_source_update,
+					      .get_properties = flutter_source_properties,
+					      .icon_type = OBS_ICON_TYPE_MEDIA};
