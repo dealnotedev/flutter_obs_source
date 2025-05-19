@@ -40,9 +40,15 @@ static void log_message_callback(const char *tag, const char *message, void *use
 static void platform_message_callback(const FlutterPlatformMessage *message, void *user_data)
 {
 	blog(LOG_INFO, "[Flutter] platform_message_callback");
+
+	const struct flutter_source *ctx = user_data;
+
+	if (message->response_handle) {
+		FlutterEngineSendPlatformMessageResponse(ctx->engine, message->response_handle, NULL, 0);
+	}
 }
 
-static void get_assets_paths(wchar_t* assets_path, wchar_t* icu_path, wchar_t* aot_path)
+static void get_assets_paths(wchar_t *assets_path, wchar_t *icu_path, wchar_t *aot_path)
 {
 	HMODULE hModule = NULL;
 
@@ -58,8 +64,8 @@ static void get_assets_paths(wchar_t* assets_path, wchar_t* icu_path, wchar_t* a
 	wsprintfW(base_folder, L"%s\\flutter_template", dll_path);
 
 	wsprintfW(assets_path, L"%s\\flutter_assets", base_folder);
-	wsprintfW(icu_path,    L"%s\\icudtl.dat",    base_folder);
-	wsprintfW(aot_path,    L"%s\\app.so",        base_folder);
+	wsprintfW(icu_path, L"%s\\icudtl.dat", base_folder);
+	wsprintfW(aot_path, L"%s\\app.so", base_folder);
 }
 
 void init_flutter_engine(struct flutter_source *context)
@@ -72,8 +78,8 @@ void init_flutter_engine(struct flutter_source *context)
 
 	char assets_path[MAX_PATH], icu_path[MAX_PATH], aot_path[MAX_PATH];
 	WideCharToMultiByte(CP_UTF8, 0, assets_path_w, -1, assets_path, MAX_PATH, NULL, NULL);
-	WideCharToMultiByte(CP_UTF8, 0, icu_path_w,    -1, icu_path,    MAX_PATH, NULL, NULL);
-	WideCharToMultiByte(CP_UTF8, 0, aot_path_w,    -1, aot_path,    MAX_PATH, NULL, NULL);
+	WideCharToMultiByte(CP_UTF8, 0, icu_path_w, -1, icu_path, MAX_PATH, NULL, NULL);
+	WideCharToMultiByte(CP_UTF8, 0, aot_path_w, -1, aot_path, MAX_PATH, NULL, NULL);
 
 	FlutterSoftwareRendererConfig software_config = {0};
 	software_config.struct_size = sizeof(FlutterSoftwareRendererConfig);
@@ -91,12 +97,7 @@ void init_flutter_engine(struct flutter_source *context)
 	project_args.assets_path = assets_path;
 	project_args.icu_data_path = icu_path;
 
-	static const char *engine_argv[] = {"obs_flutter", // dummy exe name
-					    "--verbose-logging",
-					    "--disable-service-auth-codes",
-					    "--observatory-port=0",
-					    "--enable-software-rendering",
-					    "--skia-deterministic-rendering"};
+	static const char *engine_argv[] = {"obs_flutter", "--verbose-logging"};
 
 	project_args.command_line_argc = _countof(engine_argv);
 	project_args.command_line_argv = engine_argv;
