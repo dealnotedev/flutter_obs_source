@@ -1,119 +1,141 @@
-// NOTE: этот файл основан на вашем исходнике flutter-source.c.
-// Добавлена полноценная реализация custom_task_runners, которая
-// привязывает platform task‑runner к worker‑thread. Все остальное
-// оставлено без изменений, кроме минимально‑необходимых правок.
+/*
+ * flutter_source_custom_task_runners.c
+ * -----------------------------------
+ * OBS Studio source plug‑in that embeds the Flutter engine on Windows.
+ * The engine runs on a dedicated worker thread and communicates with OBS
+ * via a software texture.  A custom platform task‑runner is used so that
+ * all platform messages are executed on the same worker thread.
+ *
+ * Build:  drop this file into an OBS plug‑in project and link against
+ *         the Flutter Embedder DLL + libobs.
+ */
 
-#include <obs-module.h>
-#include "flutter_embedder.h"
-#include <graphics/graphics.h>
+//  ────────────────   Standard library / Windows   ────────────────
 #include <stdint.h>
 #include <stdlib.h>
 #include <windows.h>
 #include <Shlwapi.h>
 #pragma comment(lib, "Shlwapi.lib")
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Worker‑thread infrastructure
-// ─────────────────────────────────────────────────────────────────────────────
+//  ────────────────   OBS & Flutter headers   ────────────────
+#include <obs-module.h>
+#include <graphics/graphics.h>
+#include "flutter_embedder.h"
+
+//  ────────────────────────────────────────────────────────────────
+//  Worker‑thread infrastructure
+//  ────────────────────────────────────────────────────────────────
 
 typedef enum {
 	CMD_CREATE_ENGINE,
 	CMD_DESTROY_ENGINE,
-	CMD_RUN_ENGINE_TASK, // <‑‑ NEW: выполняем FlutterTask на worker‑thread
+	CMD_RUN_ENGINE_TASK, // Execute a pending FlutterTask
 	CMD_EXIT,
-} flutter_command_type;
+} command_type_t;
 
-struct flutter_source; // fwd
+struct flutter_source; // forward declaration
 
 typedef struct {
-	flutter_command_type type;
-	struct flutter_source *ctx;
-	FlutterTask task;
-	uint64_t target_time_nanos;
-	HANDLE done_event;
-} flutter_command;
+	command_type_t type;
+	struct flutter_source *ctx; // source instance owner
+	FlutterTask task;           // used by CMD_RUN_ENGINE_TASK
+	uint64_t target_time_ns;    //   "    "
+	HANDLE done_event;          // event to signal when cmd is done
+} command_t;
 
-#define MAX_COMMANDS 128
+#define QUEUE_CAPACITY 128
+
 typedef struct {
-	flutter_command queue[MAX_COMMANDS];
-	int head, tail;
-	CRITICAL_SECTION lock;
-	HANDLE sem_command;
+	command_t items[QUEUE_CAPACITY];
+	int head, tail; // ring‑buffer indexes
+	CRITICAL_SECTION cs;
+	HANDLE sem; // counts pending commands
 } command_queue_t;
 
-static command_queue_t g_command_queue;
+static command_queue_t g_queue;
 static HANDLE g_worker_thread = NULL;
-static DWORD g_worker_thread_id = 0; // <‑‑ сохраняем tid
-static LONG g_source_count = 0;
+static DWORD g_worker_tid = 0;  // thread id
+static LONG g_source_count = 0; // active sources
 
-// queue helpers … (без изменений)
-static void command_queue_init(command_queue_t *q)
+// ––– queue helpers ––––––––––––––––––––––––––––––––––––––––––––
+static void queue_init(command_queue_t *q)
 {
-	InitializeCriticalSection(&q->lock);
-	q->sem_command = CreateSemaphore(NULL, 0, MAX_COMMANDS, NULL);
+	InitializeCriticalSection(&q->cs);
+	q->sem = CreateSemaphore(NULL, 0, QUEUE_CAPACITY, NULL);
 	q->head = q->tail = 0;
 }
-static void command_queue_destroy(command_queue_t *q)
+
+static void queue_destroy(command_queue_t *q)
 {
-	DeleteCriticalSection(&q->lock);
-	CloseHandle(q->sem_command);
+	DeleteCriticalSection(&q->cs);
+	CloseHandle(q->sem);
 }
-static void command_queue_push(command_queue_t *q, flutter_command *cmd)
+
+static void queue_push(command_queue_t *q, const command_t *cmd)
 {
-	EnterCriticalSection(&q->lock);
-	q->queue[q->tail] = *cmd;
-	q->tail = (q->tail + 1) % MAX_COMMANDS;
-	LeaveCriticalSection(&q->lock);
-	ReleaseSemaphore(q->sem_command, 1, NULL);
+	EnterCriticalSection(&q->cs);
+	q->items[q->tail] = *cmd;
+	q->tail = (q->tail + 1) % QUEUE_CAPACITY;
+	LeaveCriticalSection(&q->cs);
+	ReleaseSemaphore(q->sem, 1, NULL);
 }
-static bool command_queue_pop(command_queue_t *q, flutter_command *out_cmd)
+
+static bool queue_pop(command_queue_t *q, command_t *out)
 {
-	WaitForSingleObject(q->sem_command, INFINITE);
-	EnterCriticalSection(&q->lock);
+	WaitForSingleObject(q->sem, INFINITE);
+
+	EnterCriticalSection(&q->cs);
 	if (q->head == q->tail) {
-		LeaveCriticalSection(&q->lock);
+		LeaveCriticalSection(&q->cs);
 		return false;
 	}
-	*out_cmd = q->queue[q->head];
-	q->head = (q->head + 1) % MAX_COMMANDS;
-	LeaveCriticalSection(&q->lock);
+	*out = q->items[q->head];
+	q->head = (q->head + 1) % QUEUE_CAPACITY;
+	LeaveCriticalSection(&q->cs);
 	return true;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// OBS <‑‑> Flutter source
-// ─────────────────────────────────────────────────────────────────────────────
+//  ────────────────────────────────────────────────────────────────
+//  OBS <‑‑> Flutter source structure
+//  ────────────────────────────────────────────────────────────────
 
 struct flutter_source {
-	// ‑‑ сохранено из вашего файла ‑‑
+	// OBS data
 	obs_source_t *source;
+
+	// Flutter data
 	FlutterEngine engine;
-	uint8_t *pixel_data;
-	uint32_t width, height;
-	gs_texture_t *texture;
 	FlutterEngineAOTData aot_data;
+	uint32_t width, height;
+	uint8_t *pixel_data; // RGBA buffer sent to texture
+	gs_texture_t *texture;
 	volatile LONG dirty_pixels;
 
-	// ----- ДЛЯ CUSTOM TASK RUNNERS -----
-	DWORD engine_thread_id; // tid worker‑thread, где запущен движок
+	// custom task‑runner bookkeeping
+	DWORD engine_tid; // worker thread id
 	FlutterTaskRunnerDescription platform_runner_desc;
 	FlutterCustomTaskRunners custom_runners;
 };
 
-// forward declarations
-static void init_flutter_engine(struct flutter_source *context);
-static void shutdown_flutter_engine(struct flutter_source *context);
+//  ────────────────────────────────────────────────────────────────
+//  Forward declarations
+//  ────────────────────────────────────────────────────────────────
+static void engine_init(struct flutter_source *ctx);
+static void engine_shutdown(struct flutter_source *ctx);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Логи и callbacks
-// ─────────────────────────────────────────────────────────────────────────────
-
-static void print_thread_id(const char *tag)
+//  ────────────────────────────────────────────────────────────────
+//  Logging helpers
+//  ────────────────────────────────────────────────────────────────
+static inline void log_tid(const char *tag)
 {
 	blog(LOG_INFO, "[%s] tid=%lu", tag, (unsigned long)GetCurrentThreadId());
 }
 
-static bool my_surface_present_callback(void *user_data, const void *allocation, size_t row_bytes, size_t height)
+//  ────────────────────────────────────────────────────────────────
+//  Flutter embedder callbacks
+//  ────────────────────────────────────────────────────────────────
+
+static bool surface_present_cb(void *user_data, const void *allocation, size_t row_bytes, size_t height)
 {
 	struct flutter_source *ctx = user_data;
 	if (!ctx->pixel_data)
@@ -123,75 +145,73 @@ static bool my_surface_present_callback(void *user_data, const void *allocation,
 	return true;
 }
 
-static void log_message_callback(const char *tag, const char *message, void *user_data)
+static void log_message_cb(const char *tag, const char *msg, void *user_data)
 {
-	print_thread_id("log_message_callback");
-	blog(LOG_INFO, "[Flutter] [%s] %s", tag ? tag : "no‑tag", message ? message : "(null)");
+	(void)user_data;
+	log_tid("log_message");
+	blog(LOG_INFO, "[Flutter] [%s] %s", tag ? tag : "no‑tag", msg ? msg : "(null)");
 }
 
-static void platform_message_callback(const FlutterPlatformMessage *message, void *user_data)
+static void platform_message_cb(const FlutterPlatformMessage *msg, void *user_data)
 {
-	print_thread_id("platform_message_callback");
-	blog(LOG_INFO, "[Flutter] platform_message_callback");
-	const struct flutter_source *ctx = user_data;
-	if (message->response_handle) {
-		FlutterEngineSendPlatformMessageResponse(ctx->engine, message->response_handle, NULL, 0);
+	struct flutter_source *ctx = user_data;
+	log_tid("platform_message");
+
+	// Echo an empty success reply so Dart side can await the call safely
+	if (msg->response_handle) {
+		FlutterEngineSendPlatformMessageResponse(ctx->engine, msg->response_handle, NULL, 0);
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// custom_task_runners helpers
-// ─────────────────────────────────────────────────────────────────────────────
+//  ────────────────────────────────────────────────────────────────
+//  Task‑runner helpers (called by Flutter)
+//  ────────────────────────────────────────────────────────────────
 
-// Проверяем: на worker‑thread ли мы?
 static bool runs_on_worker_thread(void *user_data)
 {
-	struct flutter_source *ctx = (struct flutter_source *)user_data;
-	return GetCurrentThreadId() == ctx->engine_thread_id;
+	struct flutter_source *ctx = user_data;
+	return GetCurrentThreadId() == ctx->engine_tid;
 }
 
-// Постим задачу из любого потока в очередь worker‑thread
-static bool post_task_to_worker(FlutterTask task, uint64_t target_time_nanos, void *user_data)
+static bool post_task_to_worker(FlutterTask task, uint64_t target_time_ns, void *user_data)
 {
-	struct flutter_source *ctx = (struct flutter_source *)user_data;
-	flutter_command cmd = {
+	struct flutter_source *ctx = user_data;
+	command_t cmd = {
 		.type = CMD_RUN_ENGINE_TASK,
 		.ctx = ctx,
 		.task = task,
-		.target_time_nanos = target_time_nanos,
+		.target_time_ns = target_time_ns,
 		.done_event = NULL,
 	};
-	command_queue_push(&g_command_queue, &cmd);
-	return true; // принято
+	queue_push(&g_queue, &cmd);
+	return true;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Worker‑thread main loop
-// ─────────────────────────────────────────────────────────────────────────────
+//  ────────────────────────────────────────────────────────────────
+//  Worker thread main procedure
+//  ────────────────────────────────────────────────────────────────
 
-static DWORD WINAPI flutter_worker_thread(LPVOID param)
+static DWORD WINAPI worker_thread_fn(LPVOID param)
 {
-	g_worker_thread_id = GetCurrentThreadId();
-	print_thread_id("worker_thread_started");
+	(void)param;
+	g_worker_tid = GetCurrentThreadId();
+	log_tid("worker_started");
 
-	for (;;) {
-		flutter_command cmd;
-		if (!command_queue_pop(&g_command_queue, &cmd))
-			continue;
-
+	command_t cmd;
+	while (queue_pop(&g_queue, &cmd)) {
 		switch (cmd.type) {
 		case CMD_CREATE_ENGINE:
-			init_flutter_engine(cmd.ctx);
+			engine_init(cmd.ctx);
 			break;
 		case CMD_DESTROY_ENGINE:
-			shutdown_flutter_engine(cmd.ctx);
+			engine_shutdown(cmd.ctx);
 			break;
 		case CMD_RUN_ENGINE_TASK: {
 			uint64_t now = FlutterEngineGetCurrentTime();
-			if (now < cmd.target_time_nanos) {
-				DWORD delay_ms = (DWORD)((cmd.target_time_nanos - now) / 1000000ULL);
-				if (delay_ms)
-					Sleep(delay_ms);
+			if (now < cmd.target_time_ns) {
+				DWORD sleep_ms = (DWORD)((cmd.target_time_ns - now) / 1000000ULL);
+				if (sleep_ms)
+					Sleep(sleep_ms);
 			}
 			if (cmd.ctx && cmd.ctx->engine)
 				FlutterEngineRunTask(cmd.ctx->engine, &cmd.task);
@@ -205,300 +225,284 @@ static DWORD WINAPI flutter_worker_thread(LPVOID param)
 		if (cmd.done_event)
 			SetEvent(cmd.done_event);
 	}
+	return 0;
 }
 
 static void ensure_worker_thread(void)
 {
 	if (!g_worker_thread) {
-		command_queue_init(&g_command_queue);
-		g_worker_thread = CreateThread(NULL, 0, flutter_worker_thread, NULL, 0, &g_worker_thread_id);
+		queue_init(&g_queue);
+		g_worker_thread = CreateThread(NULL, 0, worker_thread_fn, NULL, 0, &g_worker_tid);
 	}
 }
+
 static void stop_worker_thread(void)
 {
 	if (g_worker_thread) {
 		HANDLE done = CreateEvent(NULL, FALSE, FALSE, NULL);
-		flutter_command cmd = {.type = CMD_EXIT, .done_event = done};
-		command_queue_push(&g_command_queue, &cmd);
+		command_t cmd = {.type = CMD_EXIT, .done_event = done};
+		queue_push(&g_queue, &cmd);
 		WaitForSingleObject(done, INFINITE);
 		CloseHandle(done);
 		CloseHandle(g_worker_thread);
-		command_queue_destroy(&g_command_queue);
+		queue_destroy(&g_queue);
 		g_worker_thread = NULL;
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helper to locate assets (unchanged)
-// ─────────────────────────────────────────────────────────────────────────────
+//  ────────────────────────────────────────────────────────────────
+//  Helpers: locate assets next to the plug‑in DLL
+//  ────────────────────────────────────────────────────────────────
 
-static void get_assets_paths(wchar_t *assets_path, wchar_t *icu_path, wchar_t *aot_path)
+static void locate_assets(wchar_t *assets_path, wchar_t *icu_path, wchar_t *aot_path)
 {
-	HMODULE hModule = NULL;
+	HMODULE self = NULL;
 	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-			   (LPCWSTR)&get_assets_paths, &hModule);
+			   (LPCWSTR)&locate_assets, &self);
 
-	wchar_t dll_path[MAX_PATH];
-	GetModuleFileNameW(hModule, dll_path, MAX_PATH);
-	PathRemoveFileSpecW(dll_path);
+	wchar_t dll_folder[MAX_PATH];
+	GetModuleFileNameW(self, dll_folder, MAX_PATH);
+	PathRemoveFileSpecW(dll_folder);
 
-	wchar_t base_folder[MAX_PATH];
-	wsprintfW(base_folder, L"%s\\flutter_template", dll_path);
-
-	wsprintfW(assets_path, L"%s\\flutter_assets", base_folder);
-	wsprintfW(icu_path, L"%s\\icudtl.dat", base_folder);
-	wsprintfW(aot_path, L"%s\\app.so", base_folder);
+	wsprintfW(assets_path, L"%s\\flutter_template\\flutter_assets", dll_folder);
+	wsprintfW(icu_path, L"%s\\flutter_template\\icudtl.dat", dll_folder);
+	wsprintfW(aot_path, L"%s\\flutter_template\\app.so", dll_folder);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Flutter engine lifecycle
-// ─────────────────────────────────────────────────────────────────────────────
+//  ────────────────────────────────────────────────────────────────
+//  Flutter engine lifecycle (runs on worker thread)
+//  ────────────────────────────────────────────────────────────────
 
-static void init_flutter_engine(struct flutter_source *ctx)
+static void engine_init(struct flutter_source *ctx)
 {
-	print_thread_id("init_flutter_engine");
+	log_tid("engine_init");
+	ctx->engine_tid = GetCurrentThreadId();
 
-	ctx->engine_thread_id = GetCurrentThreadId(); // <‑‑ для task‑runner‑а
+	// Allocate pixel buffer for the software renderer
+	ctx->pixel_data = calloc(ctx->width * ctx->height, 4);
 
-	ctx->pixel_data = (uint8_t *)malloc(ctx->width * ctx->height * 4);
-	memset(ctx->pixel_data, 0, ctx->width * ctx->height * 4);
-
-	// Πути к ресурсам … (без изменений)
+	// Resolve asset paths (UTF‑8)
 	wchar_t assets_w[MAX_PATH], icu_w[MAX_PATH], aot_w[MAX_PATH];
-	get_assets_paths(assets_w, icu_w, aot_w);
+	locate_assets(assets_w, icu_w, aot_w);
 
 	char assets[MAX_PATH], icu[MAX_PATH], aot[MAX_PATH];
 	WideCharToMultiByte(CP_UTF8, 0, assets_w, -1, assets, MAX_PATH, NULL, NULL);
 	WideCharToMultiByte(CP_UTF8, 0, icu_w, -1, icu, MAX_PATH, NULL, NULL);
 	WideCharToMultiByte(CP_UTF8, 0, aot_w, -1, aot, MAX_PATH, NULL, NULL);
 
-	// Renderer (software) …
-	FlutterSoftwareRendererConfig sw_cfg = {
-		.struct_size = sizeof(FlutterSoftwareRendererConfig),
-		.surface_present_callback = my_surface_present_callback,
+	// Software renderer configuration
+	FlutterSoftwareRendererConfig sw = {
+		.struct_size = sizeof(sw),
+		.surface_present_callback = surface_present_cb,
 	};
-	FlutterRendererConfig render_cfg = {
+	FlutterRendererConfig renderer = {
 		.type = kSoftware,
-		.software = sw_cfg,
+		.software = sw,
 	};
 
-	// ----- custom_task_runners setup -----
-	memset(&ctx->platform_runner_desc, 0, sizeof(ctx->platform_runner_desc));
-	ctx->platform_runner_desc.struct_size = sizeof(FlutterTaskRunnerDescription);
-	ctx->platform_runner_desc.user_data = ctx;
-	ctx->platform_runner_desc.runs_task_on_current_thread_callback = runs_on_worker_thread;
-	ctx->platform_runner_desc.post_task_callback = post_task_to_worker;
+	// Custom platform task‑runner (this worker thread)
+	ctx->platform_runner_desc = (FlutterTaskRunnerDescription){
+		.struct_size = sizeof(FlutterTaskRunnerDescription),
+		.user_data = ctx,
+		.runs_task_on_current_thread_callback = runs_on_worker_thread,
+		.post_task_callback = post_task_to_worker,
+	};
+	ctx->custom_runners = (FlutterCustomTaskRunners){
+		.struct_size = sizeof(FlutterCustomTaskRunners),
+		.platform_task_runner = &ctx->platform_runner_desc,
+	};
 
-	memset(&ctx->custom_runners, 0, sizeof(ctx->custom_runners));
-	ctx->custom_runners.struct_size = sizeof(FlutterCustomTaskRunners);
-	ctx->custom_runners.platform_task_runner = &ctx->platform_runner_desc;
-
-	// Project args …
-	FlutterProjectArgs args = {0};
-	args.struct_size = sizeof(FlutterProjectArgs);
-	args.assets_path = assets;
-	args.icu_data_path = icu;
+	// Project arguments
 	static const char *argv[] = {"obs_flutter", "--verbose-logging"};
-	args.command_line_argc = _countof(argv);
-	args.command_line_argv = argv;
-	args.log_message_callback = log_message_callback;
-	args.platform_message_callback = platform_message_callback;
-	args.custom_task_runners = &ctx->custom_runners; // <‑‑ главное!
+	FlutterProjectArgs args = {
+		.struct_size = sizeof(FlutterProjectArgs),
+		.assets_path = assets,
+		.icu_data_path = icu,
+		.command_line_argc = (int)(sizeof(argv) / sizeof(argv[0])),
+		.command_line_argv = argv,
+		.log_message_callback = log_message_cb,
+		.platform_message_callback = platform_message_cb,
+		.custom_task_runners = &ctx->custom_runners,
+	};
 
+	// Optional AOT data (ignored if file missing)
 	FlutterEngineAOTDataSource aot_src = {
 		.type = kFlutterEngineAOTDataSourceTypeElfPath,
 		.elf_path = aot,
 	};
-	if (FlutterEngineCreateAOTData(&aot_src, &ctx->aot_data) != kSuccess)
-		blog(LOG_ERROR, "Failed to load AOT data");
-	else
+	if (FlutterEngineCreateAOTData(&aot_src, &ctx->aot_data) == kSuccess)
 		args.aot_data = ctx->aot_data;
 
-	// Запускаем движок
-	FlutterEngineResult res = FlutterEngineRun(FLUTTER_ENGINE_VERSION, &render_cfg, &args, ctx, &ctx->engine);
+	// Run engine
+	FlutterEngineResult res = FlutterEngineRun(FLUTTER_ENGINE_VERSION, &renderer, &args, ctx, &ctx->engine);
 	if (res != kSuccess) {
-		blog(LOG_ERROR, "FlutterEngineRun failed: %d", res);
+		blog(LOG_ERROR, "FlutterEngineRun failed (%d)", res);
 		return;
 	}
-	blog(LOG_INFO, "FlutterEngineRun OK");
 
-	// Отправляем размеры окна
+	// Initial window metrics
 	FlutterWindowMetricsEvent wm = {
-		.struct_size = sizeof(FlutterWindowMetricsEvent),
+		.struct_size = sizeof(wm),
 		.width = ctx->width,
 		.height = ctx->height,
 		.pixel_ratio = 1.0f,
 	};
 	FlutterEngineSendWindowMetricsEvent(ctx->engine, &wm);
 	FlutterEngineScheduleFrame(ctx->engine);
+	blog(LOG_INFO, "Flutter engine started");
 }
 
-static void shutdown_flutter_engine(struct flutter_source *ctx)
+static void engine_shutdown(struct flutter_source *ctx)
 {
-	print_thread_id("shutdown_flutter_engine");
+	log_tid("engine_shutdown");
 	if (ctx->engine) {
 		FlutterEngineShutdown(ctx->engine);
 		ctx->engine = NULL;
 	}
 }
 
-// --- OBS Source Integration ---
+//  ────────────────────────────────────────────────────────────────
+//  OBS source implementation
+//  ────────────────────────────────────────────────────────────────
 
-static const char *flutter_source_get_name(void *unused)
+static const char *source_get_name(void *unused)
 {
-	UNUSED_PARAMETER(unused);
+	(void)unused;
 	return "Flutter Source";
 }
 
-static void *flutter_source_create(obs_data_t *settings, obs_source_t *source)
+static void *source_create(obs_data_t *settings, obs_source_t *src)
 {
-	struct flutter_source *context = bzalloc(sizeof(struct flutter_source));
-	context->source = source;
-	context->width = (uint32_t)obs_data_get_int(settings, "width");
-	context->height = (uint32_t)obs_data_get_int(settings, "height");
-	if (context->width == 0)
-		context->width = 320;
-	if (context->height == 0)
-		context->height = 240;
+	struct flutter_source *ctx = bzalloc(sizeof(*ctx));
+	ctx->source = src;
+	ctx->width = (uint32_t)obs_data_get_int(settings, "width");
+	ctx->height = (uint32_t)obs_data_get_int(settings, "height");
+	if (!ctx->width)
+		ctx->width = 320;
+	if (!ctx->height)
+		ctx->height = 240;
 
-	if (InterlockedIncrement(&g_source_count) == 1) {
+	if (InterlockedIncrement(&g_source_count) == 1)
 		ensure_worker_thread();
-	}
 
-	// Создание engine через worker
+	// Request engine creation on worker thread (synchronous)
 	HANDLE done = CreateEvent(NULL, FALSE, FALSE, NULL);
-	flutter_command cmd = {.type = CMD_CREATE_ENGINE, .ctx = context, .done_event = done};
-	command_queue_push(&g_command_queue, &cmd);
+	command_t cmd = {.type = CMD_CREATE_ENGINE, .ctx = ctx, .done_event = done};
+	queue_push(&g_queue, &cmd);
 	WaitForSingleObject(done, INFINITE);
 	CloseHandle(done);
-
-	return context;
+	return ctx;
 }
 
-static void flutter_source_destroy(void *data)
-{
-	struct flutter_source *context = data;
-
-	// Остановка engine через worker
-	HANDLE done = CreateEvent(NULL, FALSE, FALSE, NULL);
-	flutter_command cmd = {.type = CMD_DESTROY_ENGINE, .ctx = context, .done_event = done};
-	command_queue_push(&g_command_queue, &cmd);
-	WaitForSingleObject(done, INFINITE);
-	CloseHandle(done);
-
-	if (context->texture) {
-		gs_texture_destroy(context->texture);
-		context->texture = NULL;
-	}
-	if (context->pixel_data) {
-		free(context->pixel_data);
-		context->pixel_data = NULL;
-	}
-
-	bfree(context);
-
-	if (InterlockedDecrement(&g_source_count) == 0) {
-		stop_worker_thread();
-	}
-}
-
-static void flutter_source_render(void *data, const gs_effect_t *effect)
+static void source_destroy(void *data)
 {
 	struct flutter_source *ctx = data;
-	if (!ctx->texture) {
+
+	// Request engine shutdown (synchronous)
+	HANDLE done = CreateEvent(NULL, FALSE, FALSE, NULL);
+	command_t cmd = {.type = CMD_DESTROY_ENGINE, .ctx = ctx, .done_event = done};
+	queue_push(&g_queue, &cmd);
+	WaitForSingleObject(done, INFINITE);
+	CloseHandle(done);
+
+	if (ctx->texture)
+		gs_texture_destroy(ctx->texture);
+	free(ctx->pixel_data);
+	bfree(ctx);
+
+	if (InterlockedDecrement(&g_source_count) == 0)
+		stop_worker_thread();
+}
+
+static void source_render(void *data, const gs_effect_t *effect)
+{
+	struct flutter_source *ctx = data;
+
+	if (!ctx->texture)
 		ctx->texture = gs_texture_create(ctx->width, ctx->height, GS_BGRA, 1, NULL, GS_DYNAMIC);
-	}
-	if (InterlockedCompareExchange(&ctx->dirty_pixels, 0, 1) == 1) {
+
+	if (InterlockedCompareExchange(&ctx->dirty_pixels, 0, 1) == 1)
 		gs_texture_set_image(ctx->texture, ctx->pixel_data, ctx->width * 4, false);
-	}
+
 	if (!ctx->texture)
 		return;
 
-	const bool previous = gs_framebuffer_srgb_enabled();
+	bool srgb_prev = gs_framebuffer_srgb_enabled();
 	gs_enable_framebuffer_srgb(true);
 
 	gs_blend_state_push();
 	gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
 
-	gs_eparam_t *param = gs_effect_get_param_by_name(effect, "image");
-	gs_effect_set_texture_srgb(param, ctx->texture);
+	gs_eparam_t *img_param = gs_effect_get_param_by_name(effect, "image");
+	gs_effect_set_texture_srgb(img_param, ctx->texture);
 	gs_draw_sprite(ctx->texture, 0, ctx->width, ctx->height);
 
 	gs_blend_state_pop();
-	gs_enable_framebuffer_srgb(previous);
+	gs_enable_framebuffer_srgb(srgb_prev);
 }
 
-static uint32_t flutter_source_get_width(const void *data)
+static uint32_t source_get_width(const void *data)
 {
-	const struct flutter_source *ctx = data;
-	return ctx->width;
+	return ((struct flutter_source *)data)->width;
 }
-
-static uint32_t flutter_source_get_height(const void *data)
+static uint32_t source_get_height(const void *data)
 {
-	const struct flutter_source *ctx = data;
-	return ctx->height;
+	return ((struct flutter_source *)data)->height;
 }
 
-static obs_properties_t *flutter_source_properties(void *data)
+static obs_properties_t *source_properties(void *data)
 {
-	obs_properties_t *props = obs_properties_create();
-	obs_properties_add_int(props, "width", "Width", 320, 3840, 1);
-	obs_properties_add_int(props, "height", "Height", 240, 2160, 1);
-	return props;
+	(void)data;
+	obs_properties_t *p = obs_properties_create();
+	obs_properties_add_int(p, "width", "Width", 320, 3840, 1);
+	obs_properties_add_int(p, "height", "Height", 240, 2160, 1);
+	return p;
 }
 
-static void flutter_source_update(void *data, obs_data_t *settings)
+static void source_update(void *data, obs_data_t *settings)
 {
 	struct flutter_source *ctx = data;
+	uint32_t w = (uint32_t)obs_data_get_int(settings, "width");
+	uint32_t h = (uint32_t)obs_data_get_int(settings, "height");
+	if (!w)
+		w = 320;
+	if (!h)
+		h = 240;
 
-	uint32_t new_width = (uint32_t)obs_data_get_int(settings, "width");
-	uint32_t new_height = (uint32_t)obs_data_get_int(settings, "height");
-
-	if (new_width == 0)
-		new_width = 320;
-	if (new_height == 0)
-		new_height = 240;
-
-	if (ctx->width == new_width && ctx->height == new_height)
+	if (w == ctx->width && h == ctx->height)
 		return;
 
-	if (ctx->texture) {
-		gs_texture_destroy(ctx->texture);
-		ctx->texture = NULL;
-	}
-	if (ctx->pixel_data) {
-		free(ctx->pixel_data);
-		ctx->pixel_data = NULL;
-	}
+	ctx->width = w;
+	ctx->height = h;
 
-	ctx->width = new_width;
-	ctx->height = new_height;
-
-	ctx->pixel_data = (uint8_t *)malloc(ctx->width * ctx->height * 4);
-	memset(ctx->pixel_data, 0, ctx->width * ctx->height * 4);
+	if (ctx->texture)
+		gs_texture_destroy(ctx->texture), ctx->texture = NULL;
+	free(ctx->pixel_data);
+	ctx->pixel_data = calloc(ctx->width * ctx->height, 4);
 
 	if (ctx->engine) {
-		FlutterWindowMetricsEvent window_event = {0};
-		window_event.struct_size = sizeof(FlutterWindowMetricsEvent);
-		window_event.width = ctx->width;
-		window_event.height = ctx->height;
-		window_event.pixel_ratio = 1.0f;
-		FlutterEngineSendWindowMetricsEvent(ctx->engine, &window_event);
-
+		FlutterWindowMetricsEvent wm = {
+			.struct_size = sizeof(wm),
+			.width = ctx->width,
+			.height = ctx->height,
+			.pixel_ratio = 1.0f,
+		};
+		FlutterEngineSendWindowMetricsEvent(ctx->engine, &wm);
 		FlutterEngineScheduleFrame(ctx->engine);
 	}
 }
 
-struct obs_source_info flutter_source_info = {.id = "flutter_source",
-					      .type = OBS_SOURCE_TYPE_INPUT,
-					      .output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_SRGB,
-					      .get_name = flutter_source_get_name,
-					      .create = flutter_source_create,
-					      .destroy = flutter_source_destroy,
-					      .video_render = flutter_source_render,
-					      .get_width = flutter_source_get_width,
-					      .get_height = flutter_source_get_height,
-					      .update = flutter_source_update,
-					      .get_properties = flutter_source_properties,
-					      .icon_type = OBS_ICON_TYPE_MEDIA};
+struct obs_source_info flutter_source_info = {
+	.id = "flutter_source",
+	.type = OBS_SOURCE_TYPE_INPUT,
+	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_SRGB,
+	.get_name = source_get_name,
+	.create = source_create,
+	.destroy = source_destroy,
+	.video_render = source_render,
+	.get_width = source_get_width,
+	.get_height = source_get_height,
+	.update = source_update,
+	.get_properties = source_properties,
+	.icon_type = OBS_ICON_TYPE_MEDIA,
+};
