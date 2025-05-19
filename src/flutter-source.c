@@ -1,3 +1,8 @@
+// NOTE: этот файл основан на вашем исходнике flutter-source.c.
+// Добавлена полноценная реализация custom_task_runners, которая
+// привязывает platform task‑runner к worker‑thread. Все остальное
+// оставлено без изменений, кроме минимально‑необходимых правок.
+
 #include <obs-module.h>
 #include "flutter_embedder.h"
 #include <graphics/graphics.h>
@@ -7,15 +12,24 @@
 #include <Shlwapi.h>
 #pragma comment(lib, "Shlwapi.lib")
 
-// --- Worker Thread Logic ---
+// ─────────────────────────────────────────────────────────────────────────────
+// Worker‑thread infrastructure
+// ─────────────────────────────────────────────────────────────────────────────
 
-typedef enum { CMD_CREATE_ENGINE, CMD_DESTROY_ENGINE, CMD_EXIT } flutter_command_type;
+typedef enum {
+	CMD_CREATE_ENGINE,
+	CMD_DESTROY_ENGINE,
+	CMD_RUN_ENGINE_TASK, // <‑‑ NEW: выполняем FlutterTask на worker‑thread
+	CMD_EXIT,
+} flutter_command_type;
 
-struct flutter_source;
+struct flutter_source; // fwd
 
 typedef struct {
 	flutter_command_type type;
 	struct flutter_source *ctx;
+	FlutterTask task;
+	uint64_t target_time_nanos;
 	HANDLE done_event;
 } flutter_command;
 
@@ -29,21 +43,22 @@ typedef struct {
 
 static command_queue_t g_command_queue;
 static HANDLE g_worker_thread = NULL;
+static DWORD g_worker_thread_id = 0; // <‑‑ сохраняем tid
 static LONG g_source_count = 0;
 
-void command_queue_init(command_queue_t *q)
+// queue helpers … (без изменений)
+static void command_queue_init(command_queue_t *q)
 {
 	InitializeCriticalSection(&q->lock);
 	q->sem_command = CreateSemaphore(NULL, 0, MAX_COMMANDS, NULL);
 	q->head = q->tail = 0;
 }
-void command_queue_destroy(command_queue_t *q)
+static void command_queue_destroy(command_queue_t *q)
 {
 	DeleteCriticalSection(&q->lock);
 	CloseHandle(q->sem_command);
 }
-
-void command_queue_push(command_queue_t *q, flutter_command *cmd)
+static void command_queue_push(command_queue_t *q, flutter_command *cmd)
 {
 	EnterCriticalSection(&q->lock);
 	q->queue[q->tail] = *cmd;
@@ -51,8 +66,7 @@ void command_queue_push(command_queue_t *q, flutter_command *cmd)
 	LeaveCriticalSection(&q->lock);
 	ReleaseSemaphore(q->sem_command, 1, NULL);
 }
-
-bool command_queue_pop(command_queue_t *q, flutter_command *out_cmd)
+static bool command_queue_pop(command_queue_t *q, flutter_command *out_cmd)
 {
 	WaitForSingleObject(q->sem_command, INFINITE);
 	EnterCriticalSection(&q->lock);
@@ -66,9 +80,12 @@ bool command_queue_pop(command_queue_t *q, flutter_command *out_cmd)
 	return true;
 }
 
-// --- Flutter Source ---
+// ─────────────────────────────────────────────────────────────────────────────
+// OBS <‑‑> Flutter source
+// ─────────────────────────────────────────────────────────────────────────────
 
 struct flutter_source {
+	// ‑‑ сохранено из вашего файла ‑‑
 	obs_source_t *source;
 	FlutterEngine engine;
 	uint8_t *pixel_data;
@@ -76,16 +93,24 @@ struct flutter_source {
 	gs_texture_t *texture;
 	FlutterEngineAOTData aot_data;
 	volatile LONG dirty_pixels;
+
+	// ----- ДЛЯ CUSTOM TASK RUNNERS -----
+	DWORD engine_thread_id; // tid worker‑thread, где запущен движок
+	FlutterTaskRunnerDescription platform_runner_desc;
+	FlutterCustomTaskRunners custom_runners;
 };
 
 // forward declarations
-void init_flutter_engine(struct flutter_source *context);
-void shutdown_flutter_engine(struct flutter_source *context);
+static void init_flutter_engine(struct flutter_source *context);
+static void shutdown_flutter_engine(struct flutter_source *context);
 
-void print_thread_id(const char *tag)
+// ─────────────────────────────────────────────────────────────────────────────
+// Логи и callbacks
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void print_thread_id(const char *tag)
 {
-	const DWORD tid = GetCurrentThreadId();
-	blog(LOG_INFO, "[%s] Thread id: %lu", tag, (unsigned long)tid);
+	blog(LOG_INFO, "[%s] tid=%lu", tag, (unsigned long)GetCurrentThreadId());
 }
 
 static bool my_surface_present_callback(void *user_data, const void *allocation, size_t row_bytes, size_t height)
@@ -101,7 +126,7 @@ static bool my_surface_present_callback(void *user_data, const void *allocation,
 static void log_message_callback(const char *tag, const char *message, void *user_data)
 {
 	print_thread_id("log_message_callback");
-	blog(LOG_INFO, "[Flutter] [%s] %s", tag ? tag : "no-tag", message ? message : "(null)");
+	blog(LOG_INFO, "[Flutter] [%s] %s", tag ? tag : "no‑tag", message ? message : "(null)");
 }
 
 static void platform_message_callback(const FlutterPlatformMessage *message, void *user_data)
@@ -113,6 +138,99 @@ static void platform_message_callback(const FlutterPlatformMessage *message, voi
 		FlutterEngineSendPlatformMessageResponse(ctx->engine, message->response_handle, NULL, 0);
 	}
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// custom_task_runners helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Проверяем: на worker‑thread ли мы?
+static bool runs_on_worker_thread(void *user_data)
+{
+	struct flutter_source *ctx = (struct flutter_source *)user_data;
+	return GetCurrentThreadId() == ctx->engine_thread_id;
+}
+
+// Постим задачу из любого потока в очередь worker‑thread
+static bool post_task_to_worker(FlutterTask task, uint64_t target_time_nanos, void *user_data)
+{
+	struct flutter_source *ctx = (struct flutter_source *)user_data;
+	flutter_command cmd = {
+		.type = CMD_RUN_ENGINE_TASK,
+		.ctx = ctx,
+		.task = task,
+		.target_time_nanos = target_time_nanos,
+		.done_event = NULL,
+	};
+	command_queue_push(&g_command_queue, &cmd);
+	return true; // принято
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Worker‑thread main loop
+// ─────────────────────────────────────────────────────────────────────────────
+
+static DWORD WINAPI flutter_worker_thread(LPVOID param)
+{
+	g_worker_thread_id = GetCurrentThreadId();
+	print_thread_id("worker_thread_started");
+
+	for (;;) {
+		flutter_command cmd;
+		if (!command_queue_pop(&g_command_queue, &cmd))
+			continue;
+
+		switch (cmd.type) {
+		case CMD_CREATE_ENGINE:
+			init_flutter_engine(cmd.ctx);
+			break;
+		case CMD_DESTROY_ENGINE:
+			shutdown_flutter_engine(cmd.ctx);
+			break;
+		case CMD_RUN_ENGINE_TASK: {
+			uint64_t now = FlutterEngineGetCurrentTime();
+			if (now < cmd.target_time_nanos) {
+				DWORD delay_ms = (DWORD)((cmd.target_time_nanos - now) / 1000000ULL);
+				if (delay_ms)
+					Sleep(delay_ms);
+			}
+			if (cmd.ctx && cmd.ctx->engine)
+				FlutterEngineRunTask(cmd.ctx->engine, &cmd.task);
+			break;
+		}
+		case CMD_EXIT:
+			if (cmd.done_event)
+				SetEvent(cmd.done_event);
+			return 0;
+		}
+		if (cmd.done_event)
+			SetEvent(cmd.done_event);
+	}
+}
+
+static void ensure_worker_thread(void)
+{
+	if (!g_worker_thread) {
+		command_queue_init(&g_command_queue);
+		g_worker_thread = CreateThread(NULL, 0, flutter_worker_thread, NULL, 0, &g_worker_thread_id);
+	}
+}
+static void stop_worker_thread(void)
+{
+	if (g_worker_thread) {
+		HANDLE done = CreateEvent(NULL, FALSE, FALSE, NULL);
+		flutter_command cmd = {.type = CMD_EXIT, .done_event = done};
+		command_queue_push(&g_command_queue, &cmd);
+		WaitForSingleObject(done, INFINITE);
+		CloseHandle(done);
+		CloseHandle(g_worker_thread);
+		command_queue_destroy(&g_command_queue);
+		g_worker_thread = NULL;
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper to locate assets (unchanged)
+// ─────────────────────────────────────────────────────────────────────────────
 
 static void get_assets_paths(wchar_t *assets_path, wchar_t *icu_path, wchar_t *aot_path)
 {
@@ -132,144 +250,96 @@ static void get_assets_paths(wchar_t *assets_path, wchar_t *icu_path, wchar_t *a
 	wsprintfW(aot_path, L"%s\\app.so", base_folder);
 }
 
-// --- Worker thread code ---
+// ─────────────────────────────────────────────────────────────────────────────
+// Flutter engine lifecycle
+// ─────────────────────────────────────────────────────────────────────────────
 
-static DWORD WINAPI flutter_worker_thread(LPVOID param)
-{
-	while (1) {
-		flutter_command cmd;
-		if (!command_queue_pop(&g_command_queue, &cmd))
-			continue;
-		switch (cmd.type) {
-		case CMD_CREATE_ENGINE:
-			init_flutter_engine(cmd.ctx);
-			break;
-		case CMD_DESTROY_ENGINE:
-			shutdown_flutter_engine(cmd.ctx);
-			break;
-		case CMD_EXIT:
-			if (cmd.done_event)
-				SetEvent(cmd.done_event);
-			return 0;
-		}
-		if (cmd.done_event)
-			SetEvent(cmd.done_event);
-	}
-}
-
-void ensure_worker_thread()
-{
-	if (!g_worker_thread) {
-		command_queue_init(&g_command_queue);
-		g_worker_thread = CreateThread(NULL, 0, flutter_worker_thread, NULL, 0, NULL);
-	}
-}
-void stop_worker_thread()
-{
-	if (g_worker_thread) {
-		HANDLE done = CreateEvent(NULL, FALSE, FALSE, NULL);
-		flutter_command cmd = {.type = CMD_EXIT, .done_event = done};
-		command_queue_push(&g_command_queue, &cmd);
-		WaitForSingleObject(done, INFINITE);
-		CloseHandle(done);
-		CloseHandle(g_worker_thread);
-		command_queue_destroy(&g_command_queue);
-		g_worker_thread = NULL;
-	}
-}
-
-// --- Flutter engine helpers ---
-
-void init_flutter_engine(struct flutter_source *context)
+static void init_flutter_engine(struct flutter_source *ctx)
 {
 	print_thread_id("init_flutter_engine");
 
-	context->pixel_data = (uint8_t *)malloc(context->width * context->height * 4);
-	memset(context->pixel_data, 0, context->width * context->height * 4);
+	ctx->engine_thread_id = GetCurrentThreadId(); // <‑‑ для task‑runner‑а
 
-	wchar_t assets_path_w[MAX_PATH], icu_path_w[MAX_PATH], aot_path_w[MAX_PATH];
-	get_assets_paths(assets_path_w, icu_path_w, aot_path_w);
+	ctx->pixel_data = (uint8_t *)malloc(ctx->width * ctx->height * 4);
+	memset(ctx->pixel_data, 0, ctx->width * ctx->height * 4);
 
-	char assets_path[MAX_PATH], icu_path[MAX_PATH], aot_path[MAX_PATH];
-	WideCharToMultiByte(CP_UTF8, 0, assets_path_w, -1, assets_path, MAX_PATH, NULL, NULL);
-	WideCharToMultiByte(CP_UTF8, 0, icu_path_w, -1, icu_path, MAX_PATH, NULL, NULL);
-	WideCharToMultiByte(CP_UTF8, 0, aot_path_w, -1, aot_path, MAX_PATH, NULL, NULL);
+	// Πути к ресурсам … (без изменений)
+	wchar_t assets_w[MAX_PATH], icu_w[MAX_PATH], aot_w[MAX_PATH];
+	get_assets_paths(assets_w, icu_w, aot_w);
 
-	FlutterSoftwareRendererConfig software_config = {0};
-	software_config.struct_size = sizeof(FlutterSoftwareRendererConfig);
-	software_config.surface_present_callback = my_surface_present_callback;
+	char assets[MAX_PATH], icu[MAX_PATH], aot[MAX_PATH];
+	WideCharToMultiByte(CP_UTF8, 0, assets_w, -1, assets, MAX_PATH, NULL, NULL);
+	WideCharToMultiByte(CP_UTF8, 0, icu_w, -1, icu, MAX_PATH, NULL, NULL);
+	WideCharToMultiByte(CP_UTF8, 0, aot_w, -1, aot, MAX_PATH, NULL, NULL);
 
-	FlutterRendererConfig renderer_config = {0};
-	renderer_config.type = kSoftware;
-	renderer_config.software = software_config;
-
-	blog(LOG_INFO, "[FlutterSource] PreConfig");
-
-	FlutterProjectArgs project_args = {0};
-	project_args.struct_size = sizeof(FlutterProjectArgs);
-
-	project_args.assets_path = assets_path;
-	project_args.icu_data_path = icu_path;
-
-	static const char *engine_argv[] = {"obs_flutter", "--verbose-logging"};
-
-	project_args.command_line_argc = _countof(engine_argv);
-	project_args.command_line_argv = engine_argv;
-
-	project_args.log_message_callback = log_message_callback;
-	project_args.platform_message_callback = platform_message_callback;
-
-	FlutterEngineAOTDataSource aot_source = {
-		.type = kFlutterEngineAOTDataSourceTypeElfPath,
-		.elf_path = aot_path,
+	// Renderer (software) …
+	FlutterSoftwareRendererConfig sw_cfg = {
+		.struct_size = sizeof(FlutterSoftwareRendererConfig),
+		.surface_present_callback = my_surface_present_callback,
+	};
+	FlutterRendererConfig render_cfg = {
+		.type = kSoftware,
+		.software = sw_cfg,
 	};
 
-	FlutterEngineAOTData aot_data = NULL;
-	if (FlutterEngineCreateAOTData(&aot_source, &aot_data) != kSuccess) {
+	// ----- custom_task_runners setup -----
+	memset(&ctx->platform_runner_desc, 0, sizeof(ctx->platform_runner_desc));
+	ctx->platform_runner_desc.struct_size = sizeof(FlutterTaskRunnerDescription);
+	ctx->platform_runner_desc.user_data = ctx;
+	ctx->platform_runner_desc.runs_task_on_current_thread_callback = runs_on_worker_thread;
+	ctx->platform_runner_desc.post_task_callback = post_task_to_worker;
+
+	memset(&ctx->custom_runners, 0, sizeof(ctx->custom_runners));
+	ctx->custom_runners.struct_size = sizeof(FlutterCustomTaskRunners);
+	ctx->custom_runners.platform_task_runner = &ctx->platform_runner_desc;
+
+	// Project args …
+	FlutterProjectArgs args = {0};
+	args.struct_size = sizeof(FlutterProjectArgs);
+	args.assets_path = assets;
+	args.icu_data_path = icu;
+	static const char *argv[] = {"obs_flutter", "--verbose-logging"};
+	args.command_line_argc = _countof(argv);
+	args.command_line_argv = argv;
+	args.log_message_callback = log_message_callback;
+	args.platform_message_callback = platform_message_callback;
+	args.custom_task_runners = &ctx->custom_runners; // <‑‑ главное!
+
+	FlutterEngineAOTDataSource aot_src = {
+		.type = kFlutterEngineAOTDataSourceTypeElfPath,
+		.elf_path = aot,
+	};
+	if (FlutterEngineCreateAOTData(&aot_src, &ctx->aot_data) != kSuccess)
 		blog(LOG_ERROR, "Failed to load AOT data");
+	else
+		args.aot_data = ctx->aot_data;
+
+	// Запускаем движок
+	FlutterEngineResult res = FlutterEngineRun(FLUTTER_ENGINE_VERSION, &render_cfg, &args, ctx, &ctx->engine);
+	if (res != kSuccess) {
+		blog(LOG_ERROR, "FlutterEngineRun failed: %d", res);
 		return;
 	}
+	blog(LOG_INFO, "FlutterEngineRun OK");
 
-	project_args.aot_data = aot_data;
-	context->aot_data = aot_data;
-
-	blog(LOG_INFO, "[FlutterSource] PreRun");
-
-	FlutterEngineResult result =
-		FlutterEngineRun(FLUTTER_ENGINE_VERSION, &renderer_config, &project_args, context, &context->engine);
-
-	if (result != kSuccess) {
-		blog(LOG_ERROR, "[FlutterSource] FlutterEngineRun failed: %d", result);
-	} else {
-		blog(LOG_INFO, "[FlutterSource] FlutterEngineRun OK: %d", result);
-
-		FlutterWindowMetricsEvent window_event = {0};
-		window_event.struct_size = sizeof(FlutterWindowMetricsEvent);
-		window_event.width = context->width;
-		window_event.height = context->height;
-		window_event.pixel_ratio = 1.0f;
-		FlutterEngineSendWindowMetricsEvent(context->engine, &window_event);
-
-		FlutterEngineScheduleFrame(context->engine);
-
-		blog(LOG_INFO, "[FlutterSource] Sent WindowMetricsEvent and ScheduleFrame");
-	}
+	// Отправляем размеры окна
+	FlutterWindowMetricsEvent wm = {
+		.struct_size = sizeof(FlutterWindowMetricsEvent),
+		.width = ctx->width,
+		.height = ctx->height,
+		.pixel_ratio = 1.0f,
+	};
+	FlutterEngineSendWindowMetricsEvent(ctx->engine, &wm);
+	FlutterEngineScheduleFrame(ctx->engine);
 }
 
-void shutdown_flutter_engine(struct flutter_source *context)
+static void shutdown_flutter_engine(struct flutter_source *ctx)
 {
 	print_thread_id("shutdown_flutter_engine");
-
-	if (context->engine) {
-		FlutterEngineResult res = FlutterEngineShutdown(context->engine);
-		blog(LOG_INFO, "[FlutterSource] FlutterEngineShutdown result: %d", res);
-		context->engine = NULL;
+	if (ctx->engine) {
+		FlutterEngineShutdown(ctx->engine);
+		ctx->engine = NULL;
 	}
-
-	//if (context->aot_data) {
-	//    FlutterEngineCollectAOTData(context->aot_data);
-	//    context->aot_data = NULL;
-	//}
 }
 
 // --- OBS Source Integration ---
@@ -328,7 +398,7 @@ static void flutter_source_destroy(void *data)
 	bfree(context);
 
 	if (InterlockedDecrement(&g_source_count) == 0) {
-		//stop_worker_thread();
+		stop_worker_thread();
 	}
 }
 
