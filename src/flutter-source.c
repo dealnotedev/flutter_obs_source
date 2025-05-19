@@ -82,6 +82,12 @@ struct flutter_source {
 void init_flutter_engine(struct flutter_source *context);
 void shutdown_flutter_engine(struct flutter_source *context);
 
+void print_thread_id(const char *tag)
+{
+	const DWORD tid = GetCurrentThreadId();
+	blog(LOG_INFO, "[%s] Thread id: %lu", tag, (unsigned long)tid);
+}
+
 static bool my_surface_present_callback(void *user_data, const void *allocation, size_t row_bytes, size_t height)
 {
 	struct flutter_source *ctx = user_data;
@@ -94,11 +100,13 @@ static bool my_surface_present_callback(void *user_data, const void *allocation,
 
 static void log_message_callback(const char *tag, const char *message, void *user_data)
 {
+	print_thread_id("log_message_callback");
 	blog(LOG_INFO, "[Flutter] [%s] %s", tag ? tag : "no-tag", message ? message : "(null)");
 }
 
 static void platform_message_callback(const FlutterPlatformMessage *message, void *user_data)
 {
+	print_thread_id("platform_message_callback");
 	blog(LOG_INFO, "[Flutter] platform_message_callback");
 	const struct flutter_source *ctx = user_data;
 	if (message->response_handle) {
@@ -174,6 +182,8 @@ void stop_worker_thread()
 
 void init_flutter_engine(struct flutter_source *context)
 {
+	print_thread_id("init_flutter_engine");
+
 	context->pixel_data = (uint8_t *)malloc(context->width * context->height * 4);
 	memset(context->pixel_data, 0, context->width * context->height * 4);
 
@@ -248,6 +258,8 @@ void init_flutter_engine(struct flutter_source *context)
 
 void shutdown_flutter_engine(struct flutter_source *context)
 {
+	print_thread_id("shutdown_flutter_engine");
+
 	if (context->engine) {
 		FlutterEngineResult res = FlutterEngineShutdown(context->engine);
 		blog(LOG_INFO, "[FlutterSource] FlutterEngineShutdown result: %d", res);
