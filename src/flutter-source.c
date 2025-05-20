@@ -208,8 +208,14 @@ static DWORD WINAPI worker_thread_fn(LPVOID param)
 			uint64_t now = FlutterEngineGetCurrentTime();
 			if (now < cmd.target_time_ns) {
 				DWORD sleep_ms = (DWORD)((cmd.target_time_ns - now) / 1000000ULL);
-				if (sleep_ms)
+				if (sleep_ms) {
+					if (sleep_ms > 16) {
+						blog(LOG_WARNING,
+						     "[FlutterSource] Delayed task execution for %lu ms (now=%llu, target=%llu)",
+						     sleep_ms, now, cmd.target_time_ns);
+					}
 					Sleep(sleep_ms);
+				}
 			}
 			if (cmd.ctx && cmd.ctx->engine)
 				FlutterEngineRunTask(cmd.ctx->engine, &cmd.task);
