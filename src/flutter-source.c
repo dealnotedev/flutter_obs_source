@@ -105,6 +105,7 @@ struct flutter_source {
 	FlutterEngine engine;
 	FlutterEngineAOTData aot_data;
 	uint32_t width, height;
+	uint32_t pixel_ratio_pct;
 	uint8_t *pixel_data; // RGBA buffer sent to texture
 	gs_texture_t *texture;
 	volatile LONG dirty_pixels;
@@ -349,8 +350,9 @@ static void engine_init(struct flutter_source *ctx)
 		.struct_size = sizeof(wm),
 		.width = ctx->width,
 		.height = ctx->height,
-		.pixel_ratio = 1.0f,
+		.pixel_ratio = (float)(ctx->pixel_ratio_pct) / 100.0f,
 	};
+
 	FlutterEngineSendWindowMetricsEvent(ctx->engine, &wm);
 	FlutterEngineScheduleFrame(ctx->engine);
 	blog(LOG_INFO, "Flutter engine started");
@@ -381,10 +383,14 @@ static void *source_create(obs_data_t *settings, obs_source_t *src)
 	ctx->source = src;
 	ctx->width = (uint32_t)obs_data_get_int(settings, "width");
 	ctx->height = (uint32_t)obs_data_get_int(settings, "height");
+	ctx->pixel_ratio_pct = (uint32_t)obs_data_get_int(settings, "pixel_ratio");
+
 	if (!ctx->width)
 		ctx->width = 320;
 	if (!ctx->height)
 		ctx->height = 240;
+	if (!ctx->pixel_ratio_pct)
+		ctx->pixel_ratio_pct = 100;
 
 	if (InterlockedIncrement(&g_source_count) == 1)
 		ensure_worker_thread();
@@ -460,7 +466,15 @@ static obs_properties_t *source_properties(void *data)
 	obs_properties_t *p = obs_properties_create();
 	obs_properties_add_int(p, "width", "Width", 320, 3840, 1);
 	obs_properties_add_int(p, "height", "Height", 240, 2160, 1);
+	obs_properties_add_int(p, "pixel_ratio", "Pixel Ratio (%)", 25, 400, 5);
 	return p;
+}
+
+static void flutter_source_defaults(obs_data_t *settings)
+{
+	obs_data_set_default_int(settings, "width",        640);
+	obs_data_set_default_int(settings, "height",       480);
+	obs_data_set_default_int(settings, "pixel_ratio",  100);
 }
 
 static void source_update(void *data, obs_data_t *settings)
@@ -468,16 +482,21 @@ static void source_update(void *data, obs_data_t *settings)
 	struct flutter_source *ctx = data;
 	uint32_t w = (uint32_t)obs_data_get_int(settings, "width");
 	uint32_t h = (uint32_t)obs_data_get_int(settings, "height");
+	uint32_t pixel_ratio = (uint32_t)obs_data_get_int(settings, "pixel_ratio");
+
 	if (!w)
 		w = 320;
 	if (!h)
 		h = 240;
+	if (!pixel_ratio)
+		pixel_ratio = 100;
 
-	if (w == ctx->width && h == ctx->height)
+	if (w == ctx->width && h == ctx->height && pixel_ratio == ctx->pixel_ratio_pct)
 		return;
 
 	ctx->width = w;
 	ctx->height = h;
+	ctx->pixel_ratio_pct = pixel_ratio;
 
 	if (ctx->texture)
 		gs_texture_destroy(ctx->texture), ctx->texture = NULL;
@@ -485,11 +504,11 @@ static void source_update(void *data, obs_data_t *settings)
 	ctx->pixel_data = calloc(ctx->width * ctx->height, 4);
 
 	if (ctx->engine) {
-		FlutterWindowMetricsEvent wm = {
+		const FlutterWindowMetricsEvent wm = {
 			.struct_size = sizeof(wm),
 			.width = ctx->width,
 			.height = ctx->height,
-			.pixel_ratio = 1.0f,
+			.pixel_ratio = (float)ctx->pixel_ratio_pct / 100.0f,
 		};
 		FlutterEngineSendWindowMetricsEvent(ctx->engine, &wm);
 		FlutterEngineScheduleFrame(ctx->engine);
@@ -504,6 +523,7 @@ struct obs_source_info flutter_source_info = {
 	.create = source_create,
 	.destroy = source_destroy,
 	.video_render = source_render,
+	.get_defaults = flutter_source_defaults,
 	.get_width = source_get_width,
 	.get_height = source_get_height,
 	.update = source_update,
