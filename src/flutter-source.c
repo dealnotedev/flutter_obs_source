@@ -636,11 +636,18 @@ static void source_destroy(void *data)
 	for (int i = 0; i < 256; ++i) {
 		if (ctx->sounds[i]) {
 			ma_sound_uninit(ctx->sounds[i]);
-			free(ctx->sounds[i]);
 		}
 	}
 
 	ma_engine_uninit(&ctx->ma);
+
+	for (int i = 0; i < 256; ++i) {
+		if (ctx->sounds[i]) {
+			free(ctx->sounds[i]);
+			ctx->sounds[i] = NULL;
+		}
+	}
+
 	free(ctx->mix_int);
 	free(ctx->mix_L);
 	free(ctx->mix_R);
