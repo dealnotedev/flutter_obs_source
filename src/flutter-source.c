@@ -629,29 +629,24 @@ static void source_destroy(void *data)
 	free(ctx->pixel_data);
 	bfree(ctx);
 
-	// START Release Audio
+	/* =========== START Release Audio =========== */
 	if (ctx->audio_timer)
 		DeleteTimerQueueTimer(NULL, ctx->audio_timer, INVALID_HANDLE_VALUE);
 
 	for (int i = 0; i < 256; ++i) {
 		if (ctx->sounds[i]) {
 			ma_sound_uninit(ctx->sounds[i]);
-		}
-	}
-
-	ma_engine_uninit(&ctx->ma);
-
-	for (int i = 0; i < 256; ++i) {
-		if (ctx->sounds[i]) {
 			free(ctx->sounds[i]);
 			ctx->sounds[i] = NULL;
 		}
 	}
 
+	ma_engine_uninit(&ctx->ma);
+
 	free(ctx->mix_int);
 	free(ctx->mix_L);
 	free(ctx->mix_R);
-	// END Release Audio
+	/* ============ END Release Audio ============ */
 
 	if (InterlockedDecrement(&g_source_count) == 0)
 		stop_worker_thread();
