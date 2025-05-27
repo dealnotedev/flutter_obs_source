@@ -624,11 +624,6 @@ static void source_destroy(void *data)
 	WaitForSingleObject(done, INFINITE);
 	CloseHandle(done);
 
-	if (ctx->texture)
-		gs_texture_destroy(ctx->texture);
-	free(ctx->pixel_data);
-	bfree(ctx);
-
 	/* =========== START Release Audio =========== */
 	if (ctx->audio_timer)
 		DeleteTimerQueueTimer(NULL, ctx->audio_timer, INVALID_HANDLE_VALUE);
@@ -647,6 +642,11 @@ static void source_destroy(void *data)
 	free(ctx->mix_L);
 	free(ctx->mix_R);
 	/* ============ END Release Audio ============ */
+
+	if (ctx->texture)
+		gs_texture_destroy(ctx->texture);
+	free(ctx->pixel_data);
+	bfree(ctx);
 
 	if (InterlockedDecrement(&g_source_count) == 0)
 		stop_worker_thread();
