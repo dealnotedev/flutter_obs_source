@@ -161,11 +161,11 @@ struct flutter_source {
 
 	/* ----------   audio   ---------- */
 	ma_engine ma;
-	ma_sound *sounds[256]; // по id, можно вектор
-	HANDLE audio_timer;    // WinAPI таймер 20 мс
-	float *mix_int;        // interleaved 2ch буфер 960 фреймов
-	float *mix_L;          // planar L
-	float *mix_R;          // planar R
+	ma_sound *sounds[256];
+	HANDLE audio_timer;
+	float *mix_int;
+	float *mix_L;
+	float *mix_R;
 };
 
 //  ────────────────────────────────────────────────────────────────
@@ -205,13 +205,12 @@ static void log_message_cb(const char *tag, const char *msg, void *user_data)
 
 audio_cmd parse_audio_json(const char *data, size_t len)
 {
-	audio_cmd out = {0}; /* все поля = 0/false */
+	audio_cmd out = {0};
 
 	cJSON *root = cJSON_ParseWithLength(data, (int)len);
 	if (!root)
-		return out; /* вернём NOP-команду */
+		return out;
 
-	/* --- cmd ------------------------------------------------------------ */
 	const cJSON *cmd = cJSON_GetObjectItemCaseSensitive(root, "cmd");
 	if (!cJSON_IsString(cmd) || !cmd->valuestring)
 		goto done;
@@ -225,25 +224,21 @@ audio_cmd parse_audio_json(const char *data, size_t len)
 	else if (strcmp(cmd->valuestring, "volume") == 0)
 		out.type = CMD_VOLUME;
 	else
-		goto done; /* неизвестно — NOP */
+		goto done;
 
-	/* --- id ------------------------------------------------------------- */
 	const cJSON *id = cJSON_GetObjectItemCaseSensitive(root, "id");
 	if (cJSON_IsNumber(id))
 		out.id = id->valueint;
 
-	/* --- volume --------------------------------------------------------- */
 	const cJSON *vol = cJSON_GetObjectItemCaseSensitive(root, "volume");
 	if (cJSON_IsNumber(vol))
 		out.volume = (float)vol->valuedouble;
 	else
 		out.volume = 1.f;
 
-	/* --- loop ----------------------------------------------------------- */
 	const cJSON *loop = cJSON_GetObjectItemCaseSensitive(root, "loop");
 	out.loop = cJSON_IsBool(loop) ? cJSON_IsTrue(loop) : false;
 
-	/* --- asset/path ----------------------------------------------------- */
 	const cJSON *asset = cJSON_GetObjectItemCaseSensitive(root, "asset");
 	if (cJSON_IsString(asset) && asset->valuestring) {
 		strncpy(out.path, asset->valuestring, sizeof(out.path) - 1);
@@ -505,17 +500,16 @@ static VOID CALLBACK audio_tick(PVOID param, BOOLEAN timedOut)
 			char full[MAX_PATH];
 			GetModuleFileNameA(NULL, full, MAX_PATH);
 			PathRemoveFileSpecA(full);
-			PathAppendA(full, c.path); /* <— простейший вариант */
+			PathAppendA(full, c.path);
+
 			ctx->sounds[c.id] = malloc(sizeof(ma_sound));
 
-			ma_result res = ma_sound_init_from_file(&ctx->ma, full,
-								MA_SOUND_FLAG_DECODE | MA_SOUND_FLAG_ASYNC,
-								NULL, /* pAllocCallbacks */
-								NULL, /* pGroup */
-								ctx->sounds[c.id]);
+			const ma_result res = ma_sound_init_from_file(&ctx->ma, full,
+								      MA_SOUND_FLAG_DECODE | MA_SOUND_FLAG_ASYNC, NULL,
+								      NULL, ctx->sounds[c.id]);
 
 			if (res == MA_SUCCESS) {
-				/* звук загружен, но ещё не запущен */
+				/* Sound loaded but not played yet */
 			} else {
 				blog(LOG_ERROR, "can't load %s (ma err %d)", full, res);
 				free(ctx->sounds[c.id]);
@@ -541,16 +535,13 @@ static VOID CALLBACK audio_tick(PVOID param, BOOLEAN timedOut)
 		}
 	}
 
-	/* 1. вычитать смешанный стерео-PCM из miniaudio (interleaved) */
 	ma_engine_read_pcm_frames(&ctx->ma, ctx->mix_int, 960, NULL);
 
-	/* 2. разложить в planar L/R → OBS любит planar float */
 	for (int i = 0; i < 960; ++i) {
 		ctx->mix_L[i] = ctx->mix_int[i * 2 + 0];
 		ctx->mix_R[i] = ctx->mix_int[i * 2 + 1];
 	}
 
-	/* 3. сформировать obs_source_audio и отправить */
 	const struct obs_source_audio out = {
 		.data = {(uint8_t *)ctx->mix_L, (uint8_t *)ctx->mix_R},
 		.frames = 960,
@@ -559,6 +550,7 @@ static VOID CALLBACK audio_tick(PVOID param, BOOLEAN timedOut)
 		.speakers = SPEAKERS_STEREO,
 		.format = AUDIO_FORMAT_FLOAT_PLANAR,
 	};
+
 	obs_source_output_audio(ctx->source, &out);
 }
 
@@ -593,7 +585,6 @@ static void *source_create(obs_data_t *settings, obs_source_t *src)
 	ctx->mix_R = malloc(sizeof(float) * 960);
 
 	CreateTimerQueueTimer(&ctx->audio_timer, NULL, audio_tick, ctx, 0, 20, WT_EXECUTEDEFAULT);
-
 	/* END Audio Config */
 
 	if (InterlockedIncrement(&g_source_count) == 1)
