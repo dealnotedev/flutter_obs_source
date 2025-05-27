@@ -65,7 +65,8 @@ typedef struct {
 	int id;
 	float volume;
 	bool loop;
-	char path[260]; // UTF-8, asset path
+	bool is_relative; /* true  -> path needs assets_dir prefix */
+	char path[260];   // UTF-8, asset path
 } audio_cmd;
 
 #define QUEUE_SIZE 128
@@ -166,6 +167,9 @@ struct flutter_source {
 	float *mix_int;
 	float *mix_L;
 	float *mix_R;
+
+	/* base assets dir (UTF‑8) */
+	char assets_dir[MAX_PATH];
 };
 
 //  ────────────────────────────────────────────────────────────────
@@ -203,10 +207,9 @@ static void log_message_cb(const char *tag, const char *msg, void *user_data)
 	blog(LOG_INFO, "[Flutter] [%s] %s", tag ? tag : "no‑tag", msg ? msg : "(null)");
 }
 
-audio_cmd parse_audio_json(const char *data, size_t len)
+static audio_cmd parse_audio_json(const char *data, size_t len)
 {
 	audio_cmd out = {0};
-
 	cJSON *root = cJSON_ParseWithLength(data, (int)len);
 	if (!root)
 		return out;
@@ -231,18 +234,22 @@ audio_cmd parse_audio_json(const char *data, size_t len)
 		out.id = id->valueint;
 
 	const cJSON *vol = cJSON_GetObjectItemCaseSensitive(root, "volume");
-	if (cJSON_IsNumber(vol))
-		out.volume = (float)vol->valuedouble;
-	else
-		out.volume = 1.f;
+	out.volume = cJSON_IsNumber(vol) ? (float)vol->valuedouble : 1.f;
 
 	const cJSON *loop = cJSON_GetObjectItemCaseSensitive(root, "loop");
 	out.loop = cJSON_IsBool(loop) ? cJSON_IsTrue(loop) : false;
 
-	const cJSON *asset = cJSON_GetObjectItemCaseSensitive(root, "asset");
-	if (cJSON_IsString(asset) && asset->valuestring) {
-		strncpy(out.path, asset->valuestring, sizeof(out.path) - 1);
-		out.path[sizeof(out.path) - 1] = '\0';
+	const cJSON *ap = cJSON_GetObjectItemCaseSensitive(root, "absolute_path");
+	if (cJSON_IsString(ap) && ap->valuestring) {
+		strncpy(out.path, ap->valuestring, sizeof(out.path) - 1);
+		out.is_relative = false;
+		goto done;
+	}
+
+	const cJSON *rel = cJSON_GetObjectItemCaseSensitive(root, "asset");
+	if (cJSON_IsString(rel) && rel->valuestring) {
+		strncpy(out.path, rel->valuestring, sizeof(out.path) - 1);
+		out.is_relative = true;
 	}
 
 done:
@@ -306,9 +313,11 @@ static DWORD WINAPI worker_thread_fn(LPVOID param)
 		case CMD_CREATE_ENGINE:
 			engine_init(cmd.ctx);
 			break;
+
 		case CMD_DESTROY_ENGINE:
 			engine_shutdown(cmd.ctx);
 			break;
+
 		case CMD_RUN_ENGINE_TASK: {
 			uint64_t now = FlutterEngineGetCurrentTime();
 			if (now < cmd.target_time_ns) {
@@ -326,6 +335,7 @@ static DWORD WINAPI worker_thread_fn(LPVOID param)
 				FlutterEngineRunTask(cmd.ctx->engine, &cmd.task);
 			break;
 		}
+
 		case CMD_EXIT:
 			if (cmd.done_event)
 				SetEvent(cmd.done_event);
@@ -434,6 +444,8 @@ static void engine_init(struct flutter_source *ctx)
 		.custom_task_runners = &ctx->custom_runners,
 	};
 
+	strncpy(ctx->assets_dir, assets, sizeof(ctx->assets_dir) - 1);
+
 	// Optional AOT data (ignored if file missing)
 	FlutterEngineAOTDataSource aot_src = {
 		.type = kFlutterEngineAOTDataSourceTypeElfPath,
@@ -498,9 +510,11 @@ static VOID CALLBACK audio_tick(PVOID param, BOOLEAN timedOut)
 			}
 
 			char full[MAX_PATH];
-			GetModuleFileNameA(NULL, full, MAX_PATH);
-			PathRemoveFileSpecA(full);
-			PathAppendA(full, c.path);
+			if (c.is_relative) {
+				snprintf(full, sizeof(full), "%s\\%s", ctx->assets_dir, c.path);
+			} else {
+				strncpy(full, c.path, sizeof(full));
+			}
 
 			ctx->sounds[c.id] = malloc(sizeof(ma_sound));
 
