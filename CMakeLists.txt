@@ -44,3 +44,33 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c)
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/include)
+
+# --- miniaudio --------------------------------------------------------------
+add_library(miniaudio_obj OBJECT src/miniaudio_impl.c)
+
+target_include_directories(miniaudio_obj
+        PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniaudio)
+
+target_compile_options(miniaudio_obj PRIVATE
+        $<$<C_COMPILER_ID:MSVC>:/wd4244 /wd4334 /wd4996>
+)
+
+if (MSVC)
+  target_compile_options(miniaudio_obj PRIVATE /std:c11)
+endif()
+
+target_sources(${CMAKE_PROJECT_NAME} PRIVATE $<TARGET_OBJECTS:miniaudio_obj>)
+# --- miniaudio --------------------------------------------------------------
+
+
+# third_party/cjson/cJSON.c  third_party/cjson/cJSON.h  (MIT)
+add_library(cjson_obj OBJECT src/third_party/cjson/cJSON.c)
+target_include_directories(cjson_obj PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cjson)
+
+if (MSVC)
+  target_compile_options(cjson_obj PRIVATE /std:c11)
+endif()
+
+target_sources(${CMAKE_PROJECT_NAME} PRIVATE
+        $<TARGET_OBJECTS:cjson_obj>)

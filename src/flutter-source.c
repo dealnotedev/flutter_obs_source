@@ -20,6 +20,13 @@
 #include <graphics/graphics.h>
 #include "flutter_embedder.h"
 
+//  ────────────────   Audio   ────────────────
+#include "./third_party/miniaudio/miniaudio.h"
+#include <util/platform.h>
+
+#include <string.h>                    /* strncpy */
+#include "./third_party/cjson/cJSON.h" /* third_party/cjson/cJSON.{h,c} */
+
 //  ────────────────────────────────────────────────────────────────
 //  Worker‑thread infrastructure
 //  ────────────────────────────────────────────────────────────────
@@ -49,6 +56,43 @@ typedef struct {
 	CRITICAL_SECTION cs;
 	HANDLE sem; // counts pending commands
 } command_queue_t;
+
+// START Audio Engine
+typedef enum { CMD_LOAD, CMD_PLAY, CMD_STOP, CMD_VOLUME } cmd_type;
+
+typedef struct {
+	cmd_type type;
+	int id;
+	float volume;
+	bool loop;
+	char path[260]; // UTF-8, asset path
+} audio_cmd;
+
+#define QUEUE_SIZE 128
+typedef struct {
+	audio_cmd items[QUEUE_SIZE];
+	volatile uint32_t head, tail;
+} cmd_queue;
+
+static bool push(cmd_queue *q, const audio_cmd *in)
+{
+	const uint32_t next = (q->head + 1) % QUEUE_SIZE;
+	if (next == q->tail)
+		return false;
+	q->items[q->head] = *in;
+	q->head = next;
+	return true;
+}
+static bool pop(cmd_queue *q, audio_cmd *out)
+{
+	if (q->tail == q->head)
+		return false;
+	*out = q->items[q->tail];
+	q->tail = (q->tail + 1) % QUEUE_SIZE;
+	return true;
+}
+static cmd_queue g_cmdq = {0};
+// END Audio Engine
 
 static command_queue_t g_queue;
 static HANDLE g_worker_thread = NULL;
@@ -114,6 +158,14 @@ struct flutter_source {
 	DWORD engine_tid; // worker thread id
 	FlutterTaskRunnerDescription platform_runner_desc;
 	FlutterCustomTaskRunners custom_runners;
+
+	/* ----------   audio   ---------- */
+	ma_engine ma;
+	ma_sound *sounds[256]; // по id, можно вектор
+	HANDLE audio_timer;    // WinAPI таймер 20 мс
+	float *mix_int;        // interleaved 2ch буфер 960 фреймов
+	float *mix_L;          // planar L
+	float *mix_R;          // planar R
 };
 
 //  ────────────────────────────────────────────────────────────────
@@ -151,10 +203,67 @@ static void log_message_cb(const char *tag, const char *msg, void *user_data)
 	blog(LOG_INFO, "[Flutter] [%s] %s", tag ? tag : "no‑tag", msg ? msg : "(null)");
 }
 
+audio_cmd parse_audio_json(const char *data, size_t len)
+{
+	audio_cmd out = {0}; /* все поля = 0/false */
+
+	cJSON *root = cJSON_ParseWithLength(data, (int)len);
+	if (!root)
+		return out; /* вернём NOP-команду */
+
+	/* --- cmd ------------------------------------------------------------ */
+	const cJSON *cmd = cJSON_GetObjectItemCaseSensitive(root, "cmd");
+	if (!cJSON_IsString(cmd) || !cmd->valuestring)
+		goto done;
+
+	if (strcmp(cmd->valuestring, "load") == 0)
+		out.type = CMD_LOAD;
+	else if (strcmp(cmd->valuestring, "play") == 0)
+		out.type = CMD_PLAY;
+	else if (strcmp(cmd->valuestring, "stop") == 0)
+		out.type = CMD_STOP;
+	else if (strcmp(cmd->valuestring, "volume") == 0)
+		out.type = CMD_VOLUME;
+	else
+		goto done; /* неизвестно — NOP */
+
+	/* --- id ------------------------------------------------------------- */
+	const cJSON *id = cJSON_GetObjectItemCaseSensitive(root, "id");
+	if (cJSON_IsNumber(id))
+		out.id = id->valueint;
+
+	/* --- volume --------------------------------------------------------- */
+	const cJSON *vol = cJSON_GetObjectItemCaseSensitive(root, "volume");
+	if (cJSON_IsNumber(vol))
+		out.volume = (float)vol->valuedouble;
+	else
+		out.volume = 1.f;
+
+	/* --- loop ----------------------------------------------------------- */
+	const cJSON *loop = cJSON_GetObjectItemCaseSensitive(root, "loop");
+	out.loop = cJSON_IsBool(loop) ? cJSON_IsTrue(loop) : false;
+
+	/* --- asset/path ----------------------------------------------------- */
+	const cJSON *asset = cJSON_GetObjectItemCaseSensitive(root, "asset");
+	if (cJSON_IsString(asset) && asset->valuestring) {
+		strncpy(out.path, asset->valuestring, sizeof(out.path) - 1);
+		out.path[sizeof(out.path) - 1] = '\0';
+	}
+
+done:
+	cJSON_Delete(root);
+	return out;
+}
+
 static void platform_message_cb(const FlutterPlatformMessage *msg, void *user_data)
 {
-	struct flutter_source *ctx = user_data;
+	const struct flutter_source *ctx = user_data;
 	log_tid("platform_message");
+
+	if (strcmp(msg->channel, "obs_audio") == 0) {
+		const audio_cmd cmd = parse_audio_json((const char *)msg->message, msg->message_size);
+		push(&g_cmdq, &cmd);
+	}
 
 	// Echo an empty success reply so Dart side can await the call safely
 	if (msg->response_handle) {
@@ -377,6 +486,82 @@ static const char *source_get_name(void *unused)
 	return "Flutter Source";
 }
 
+static VOID CALLBACK audio_tick(PVOID param, BOOLEAN timedOut)
+{
+	struct flutter_source *ctx = param;
+
+	audio_cmd c;
+	while (pop(&g_cmdq, &c)) {
+		switch (c.type) {
+		case CMD_LOAD: {
+			if (c.id < 0 || c.id >= 256)
+				break;
+
+			if (ctx->sounds[c.id]) {
+				ma_sound_uninit(ctx->sounds[c.id]);
+				free(ctx->sounds[c.id]);
+			}
+
+			char full[MAX_PATH];
+			GetModuleFileNameA(NULL, full, MAX_PATH);
+			PathRemoveFileSpecA(full);
+			PathAppendA(full, c.path); /* <— простейший вариант */
+			ctx->sounds[c.id] = malloc(sizeof(ma_sound));
+
+			ma_result res = ma_sound_init_from_file(&ctx->ma, full,
+								MA_SOUND_FLAG_DECODE | MA_SOUND_FLAG_ASYNC,
+								NULL, /* pAllocCallbacks */
+								NULL, /* pGroup */
+								ctx->sounds[c.id]);
+
+			if (res == MA_SUCCESS) {
+				/* звук загружен, но ещё не запущен */
+			} else {
+				blog(LOG_ERROR, "can't load %s (ma err %d)", full, res);
+				free(ctx->sounds[c.id]);
+				ctx->sounds[c.id] = NULL;
+			}
+			break;
+		}
+		case CMD_PLAY:
+			if (c.id < 256 && ctx->sounds[c.id]) {
+				ma_sound_set_volume(ctx->sounds[c.id], c.volume);
+				ma_sound_set_looping(ctx->sounds[c.id], c.loop);
+				ma_sound_start(ctx->sounds[c.id]);
+			}
+			break;
+		case CMD_STOP:
+			if (c.id < 256 && ctx->sounds[c.id])
+				ma_sound_stop(ctx->sounds[c.id]);
+			break;
+		case CMD_VOLUME:
+			if (c.id < 256 && ctx->sounds[c.id])
+				ma_sound_set_volume(ctx->sounds[c.id], c.volume);
+			break;
+		}
+	}
+
+	/* 1. вычитать смешанный стерео-PCM из miniaudio (interleaved) */
+	ma_engine_read_pcm_frames(&ctx->ma, ctx->mix_int, 960, NULL);
+
+	/* 2. разложить в planar L/R → OBS любит planar float */
+	for (int i = 0; i < 960; ++i) {
+		ctx->mix_L[i] = ctx->mix_int[i * 2 + 0];
+		ctx->mix_R[i] = ctx->mix_int[i * 2 + 1];
+	}
+
+	/* 3. сформировать obs_source_audio и отправить */
+	const struct obs_source_audio out = {
+		.data = {(uint8_t *)ctx->mix_L, (uint8_t *)ctx->mix_R},
+		.frames = 960,
+		.timestamp = os_gettime_ns(),
+		.samples_per_sec = 48000,
+		.speakers = SPEAKERS_STEREO,
+		.format = AUDIO_FORMAT_FLOAT_PLANAR,
+	};
+	obs_source_output_audio(ctx->source, &out);
+}
+
 static void *source_create(obs_data_t *settings, obs_source_t *src)
 {
 	struct flutter_source *ctx = bzalloc(sizeof(*ctx));
@@ -391,6 +576,25 @@ static void *source_create(obs_data_t *settings, obs_source_t *src)
 		ctx->height = 240;
 	if (!ctx->pixel_ratio_pct)
 		ctx->pixel_ratio_pct = 100;
+
+	/* START Audio Config */
+	ma_engine_config ecfg = ma_engine_config_init();
+	ecfg.channels = 2;
+	ecfg.sampleRate = 48000;
+	ecfg.noDevice = MA_TRUE;
+
+	const ma_result r = ma_engine_init(&ecfg, &ctx->ma);
+	if (r != MA_SUCCESS) {
+		blog(LOG_ERROR, "ma_engine_init failed (%d)", r);
+	}
+
+	ctx->mix_int = malloc(sizeof(float) * 960 * 2); // 20 мс @ 48 kHz
+	ctx->mix_L = malloc(sizeof(float) * 960);
+	ctx->mix_R = malloc(sizeof(float) * 960);
+
+	CreateTimerQueueTimer(&ctx->audio_timer, NULL, audio_tick, ctx, 0, 20, WT_EXECUTEDEFAULT);
+
+	/* END Audio Config */
 
 	if (InterlockedIncrement(&g_source_count) == 1)
 		ensure_worker_thread();
@@ -419,6 +623,23 @@ static void source_destroy(void *data)
 		gs_texture_destroy(ctx->texture);
 	free(ctx->pixel_data);
 	bfree(ctx);
+
+	// START Release Audio
+	if (ctx->audio_timer)
+		DeleteTimerQueueTimer(NULL, ctx->audio_timer, INVALID_HANDLE_VALUE);
+
+	for (int i = 0; i < 256; ++i) {
+		if (ctx->sounds[i]) {
+			ma_sound_uninit(ctx->sounds[i]);
+			free(ctx->sounds[i]);
+		}
+	}
+
+	ma_engine_uninit(&ctx->ma);
+	free(ctx->mix_int);
+	free(ctx->mix_L);
+	free(ctx->mix_R);
+	// END Release Audio
 
 	if (InterlockedDecrement(&g_source_count) == 0)
 		stop_worker_thread();
@@ -472,9 +693,9 @@ static obs_properties_t *source_properties(void *data)
 
 static void flutter_source_defaults(obs_data_t *settings)
 {
-	obs_data_set_default_int(settings, "width",        640);
-	obs_data_set_default_int(settings, "height",       480);
-	obs_data_set_default_int(settings, "pixel_ratio",  100);
+	obs_data_set_default_int(settings, "width", 640);
+	obs_data_set_default_int(settings, "height", 480);
+	obs_data_set_default_int(settings, "pixel_ratio", 100);
 }
 
 static void source_update(void *data, obs_data_t *settings)
@@ -518,7 +739,7 @@ static void source_update(void *data, obs_data_t *settings)
 struct obs_source_info flutter_source_info = {
 	.id = "flutter_source",
 	.type = OBS_SOURCE_TYPE_INPUT,
-	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_SRGB,
+	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_SRGB | OBS_SOURCE_AUDIO,
 	.get_name = source_get_name,
 	.create = source_create,
 	.destroy = source_destroy,
