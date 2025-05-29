@@ -170,6 +170,8 @@ struct flutter_source {
 
 	/* base assets dir (UTF‑8) */
 	char assets_dir[MAX_PATH];
+
+	char dart_config[4096];
 };
 
 //  ────────────────────────────────────────────────────────────────
@@ -257,10 +259,18 @@ done:
 	return out;
 }
 
-static void platform_message_cb(const FlutterPlatformMessage *msg, void *user_data)
+static void platform_message_cb(const FlutterPlatformMessage *msg, const void *user_data)
 {
 	const struct flutter_source *ctx = user_data;
 	log_tid("platform_message");
+
+	if (strcmp(msg->channel, "obs_config") == 0) {
+		if (strncmp((const char *)msg->message, "get_dart_config", msg->message_size) == 0) {
+			FlutterEngineSendPlatformMessageResponse(ctx->engine, msg->response_handle, ctx->dart_config,
+								 (uint32_t)strlen(ctx->dart_config));
+			return;
+		}
+	}
 
 	if (strcmp(msg->channel, "obs_audio") == 0) {
 		const audio_cmd cmd = parse_audio_json((const char *)msg->message, msg->message_size);
@@ -583,6 +593,12 @@ static void *source_create(obs_data_t *settings, obs_source_t *src)
 	if (!ctx->pixel_ratio_pct)
 		ctx->pixel_ratio_pct = 100;
 
+	const char *json_str = obs_data_get_string(settings, "dart_config");
+	if (json_str && json_str[0])
+		strncpy(ctx->dart_config, json_str, sizeof(ctx->dart_config) - 1);
+	else
+		strncpy(ctx->dart_config, "{\n\t\n}", sizeof(ctx->dart_config) - 1);
+
 	/* START Audio Config */
 	ma_engine_config ecfg = ma_engine_config_init();
 	ecfg.channels = 2;
@@ -695,6 +711,7 @@ static obs_properties_t *source_properties(void *data)
 	obs_properties_add_int(p, "width", "Width", 320, 3840, 1);
 	obs_properties_add_int(p, "height", "Height", 240, 2160, 1);
 	obs_properties_add_int(p, "pixel_ratio", "Pixel Ratio (%)", 25, 400, 5);
+	obs_properties_add_text(p, "dart_config", "Dart Config (JSON)", OBS_TEXT_MULTILINE);
 	return p;
 }
 
@@ -703,6 +720,7 @@ static void flutter_source_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "width", 640);
 	obs_data_set_default_int(settings, "height", 480);
 	obs_data_set_default_int(settings, "pixel_ratio", 100);
+	obs_data_set_default_string(settings, "dart_config", "{\n\t\n}");
 }
 
 static void source_update(void *data, obs_data_t *settings)
@@ -712,6 +730,8 @@ static void source_update(void *data, obs_data_t *settings)
 	uint32_t h = (uint32_t)obs_data_get_int(settings, "height");
 	uint32_t pixel_ratio = (uint32_t)obs_data_get_int(settings, "pixel_ratio");
 
+	const char *json_str = obs_data_get_string(settings, "dart_config");
+
 	if (!w)
 		w = 320;
 	if (!h)
@@ -719,12 +739,30 @@ static void source_update(void *data, obs_data_t *settings)
 	if (!pixel_ratio)
 		pixel_ratio = 100;
 
-	if (w == ctx->width && h == ctx->height && pixel_ratio == ctx->pixel_ratio_pct)
+	bool config_changed = false;
+
+	const char *default_dart_config = "{\n\t\n}";
+	const char *dart_config = json_str && json_str[0] ? json_str : default_dart_config;
+
+	if (strncmp(ctx->dart_config, dart_config, sizeof(ctx->dart_config) - 1) != 0) {
+		config_changed = true;
+	}
+
+	if (w == ctx->width && h == ctx->height && pixel_ratio == ctx->pixel_ratio_pct && !config_changed)
 		return;
 
 	ctx->width = w;
 	ctx->height = h;
 	ctx->pixel_ratio_pct = pixel_ratio;
+	strncpy(ctx->dart_config, dart_config, sizeof(ctx->dart_config) - 1);
+
+	const FlutterPlatformMessageResponseHandle *dummy = NULL;
+	FlutterEngineSendPlatformMessage(ctx->engine,
+					 &(FlutterPlatformMessage){.struct_size = sizeof(FlutterPlatformMessage),
+								   .channel = "obs_config",
+								   .message = (const uint8_t *)ctx->dart_config,
+								   .message_size = (uint32_t)strlen(ctx->dart_config),
+								   .response_handle = dummy});
 
 	if (ctx->texture)
 		gs_texture_destroy(ctx->texture), ctx->texture = NULL;
