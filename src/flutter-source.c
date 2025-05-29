@@ -172,6 +172,8 @@ struct flutter_source {
 	char assets_dir[MAX_PATH];
 
 	char dart_config[4096];
+
+	CRITICAL_SECTION tex_cs;
 };
 
 //  ────────────────────────────────────────────────────────────────
@@ -287,16 +289,16 @@ static void platform_message_cb(const FlutterPlatformMessage *msg, const void *u
 //  Task‑runner helpers (called by Flutter)
 //  ────────────────────────────────────────────────────────────────
 
-static bool runs_on_worker_thread(void *user_data)
+static bool runs_on_worker_thread(const void *user_data)
 {
-	struct flutter_source *ctx = user_data;
+	const struct flutter_source *ctx = user_data;
 	return GetCurrentThreadId() == ctx->engine_tid;
 }
 
-static bool post_task_to_worker(FlutterTask task, uint64_t target_time_ns, void *user_data)
+static bool post_task_to_worker(const FlutterTask task, const uint64_t target_time_ns, void *user_data)
 {
 	struct flutter_source *ctx = user_data;
-	command_t cmd = {
+	const command_t cmd = {
 		.type = CMD_RUN_ENGINE_TASK,
 		.ctx = ctx,
 		.task = task,
@@ -406,9 +408,6 @@ static void engine_init(struct flutter_source *ctx)
 {
 	log_tid("engine_init");
 	ctx->engine_tid = GetCurrentThreadId();
-
-	// Allocate pixel buffer for the software renderer
-	ctx->pixel_data = calloc(ctx->width * ctx->height, 4);
 
 	// Resolve asset paths (UTF‑8)
 	wchar_t assets_w[MAX_PATH], icu_w[MAX_PATH], aot_w[MAX_PATH];
@@ -586,6 +585,10 @@ static void *source_create(obs_data_t *settings, obs_source_t *src)
 	ctx->height = (uint32_t)obs_data_get_int(settings, "height");
 	ctx->pixel_ratio_pct = (uint32_t)obs_data_get_int(settings, "pixel_ratio");
 
+	// Allocate pixel buffer for the software renderer
+	InitializeCriticalSection(&ctx->tex_cs);
+	ctx->pixel_data = calloc(ctx->width * ctx->height, 4);
+
 	if (!ctx->width)
 		ctx->width = 320;
 	if (!ctx->height)
@@ -659,9 +662,17 @@ static void source_destroy(void *data)
 	free(ctx->mix_R);
 	/* ============ END Release Audio ============ */
 
+	EnterCriticalSection(&ctx->tex_cs);
+
 	if (ctx->texture)
 		gs_texture_destroy(ctx->texture);
+	ctx->texture = NULL;
+
 	free(ctx->pixel_data);
+	ctx->pixel_data = NULL;
+
+	LeaveCriticalSection(&ctx->tex_cs);
+	DeleteCriticalSection(&ctx->tex_cs);
 	bfree(ctx);
 
 	if (InterlockedDecrement(&g_source_count) == 0)
@@ -672,8 +683,10 @@ static void source_render(void *data, const gs_effect_t *effect)
 {
 	struct flutter_source *ctx = data;
 
+	EnterCriticalSection(&ctx->tex_cs);
 	if (!ctx->texture)
 		ctx->texture = gs_texture_create(ctx->width, ctx->height, GS_BGRA, 1, NULL, GS_DYNAMIC);
+	LeaveCriticalSection(&ctx->tex_cs);
 
 	if (InterlockedCompareExchange(&ctx->dirty_pixels, 0, 1) == 1)
 		gs_texture_set_image(ctx->texture, ctx->pixel_data, ctx->width * 4, false);
@@ -739,21 +752,29 @@ static void source_update(void *data, obs_data_t *settings)
 	if (!pixel_ratio)
 		pixel_ratio = 100;
 
-	bool config_changed = false;
+	const bool resize = w != ctx->width || h != ctx->height || pixel_ratio != ctx->pixel_ratio_pct;
 
-	const char *default_dart_config = "{\n\t\n}";
-	const char *dart_config = json_str && json_str[0] ? json_str : default_dart_config;
+	const char *default_json = "{\n\t\n}";
+	const char *dart_config = (json_str && json_str[0]) ? json_str : default_json;
+	const bool config_changed = strncmp(ctx->dart_config, dart_config, sizeof(ctx->dart_config) - 1) != 0;
 
-	if (strncmp(ctx->dart_config, dart_config, sizeof(ctx->dart_config) - 1) != 0) {
-		config_changed = true;
-	}
-
-	if (w == ctx->width && h == ctx->height && pixel_ratio == ctx->pixel_ratio_pct && !config_changed)
+	if (!resize && !config_changed)
 		return;
 
-	ctx->width = w;
-	ctx->height = h;
-	ctx->pixel_ratio_pct = pixel_ratio;
+	if (resize) {
+		EnterCriticalSection(&ctx->tex_cs);
+		if (ctx->texture)
+			gs_texture_destroy(ctx->texture), ctx->texture = NULL;
+		free(ctx->pixel_data);
+
+		ctx->width = w;
+		ctx->height = h;
+		ctx->pixel_ratio_pct = pixel_ratio;
+
+		ctx->pixel_data = calloc(ctx->width * ctx->height, 4);
+		LeaveCriticalSection(&ctx->tex_cs);
+	}
+
 	strncpy(ctx->dart_config, dart_config, sizeof(ctx->dart_config) - 1);
 
 	const FlutterPlatformMessageResponseHandle *dummy = NULL;
@@ -763,11 +784,6 @@ static void source_update(void *data, obs_data_t *settings)
 								   .message = (const uint8_t *)ctx->dart_config,
 								   .message_size = (uint32_t)strlen(ctx->dart_config),
 								   .response_handle = dummy});
-
-	if (ctx->texture)
-		gs_texture_destroy(ctx->texture), ctx->texture = NULL;
-	free(ctx->pixel_data);
-	ctx->pixel_data = calloc(ctx->width * ctx->height, 4);
 
 	if (ctx->engine) {
 		const FlutterWindowMetricsEvent wm = {
