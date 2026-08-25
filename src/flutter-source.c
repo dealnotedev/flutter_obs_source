@@ -395,9 +395,9 @@ static void locate_assets(wchar_t *assets_path, wchar_t *icu_path, wchar_t *aot_
 	GetModuleFileNameW(self, dll_folder, MAX_PATH);
 	PathRemoveFileSpecW(dll_folder);
 
-	wsprintfW(assets_path, L"%s\\flutter_template\\flutter_assets", dll_folder);
-	wsprintfW(icu_path, L"%s\\flutter_template\\icudtl.dat", dll_folder);
-	wsprintfW(aot_path, L"%s\\flutter_template\\app.so", dll_folder);
+	wsprintfW(assets_path, L"%s\\flutter_obs_source\\flutter_assets", dll_folder);
+	wsprintfW(icu_path, L"%s\\flutter_obs_source\\icudtl.dat", dll_folder);
+	wsprintfW(aot_path, L"%s\\flutter_obs_source\\app.so", dll_folder);
 }
 
 //  ────────────────────────────────────────────────────────────────
