@@ -12,6 +12,7 @@ typedef enum {
 	FLUTTER_AUDIO_CMD_PLAY,
 	FLUTTER_AUDIO_CMD_PAUSE,
 	FLUTTER_AUDIO_CMD_RESUME,
+	FLUTTER_AUDIO_CMD_SEEK,
 	FLUTTER_AUDIO_CMD_STOP,
 	FLUTTER_AUDIO_CMD_VOLUME,
 } flutter_audio_cmd_type;
@@ -20,6 +21,7 @@ typedef struct {
 	flutter_audio_cmd_type type;
 	int id;
 	float volume;
+	uint64_t position_ms;
 	bool loop;
 	bool is_relative;
 	char path[FLUTTER_AUDIO_PATH_CAPACITY];

@@ -43,6 +43,12 @@ int main(void)
 	CHECK(command.type == FLUTTER_AUDIO_CMD_RESUME);
 	CHECK(command.id == 7);
 
+	const char *seek = "{\"cmd\":\"seek\",\"id\":7,\"position_ms\":90500}";
+	CHECK(flutter_parse_audio_json(seek, strlen(seek), &command));
+	CHECK(command.type == FLUTTER_AUDIO_CMD_SEEK);
+	CHECK(command.id == 7);
+	CHECK(command.position_ms == 90500);
+
 	const char *load = "{\"cmd\":\"load\",\"id\":2,\"asset\":\"assets/sound.wav\"}";
 	CHECK(flutter_parse_audio_json(load, strlen(load), &command));
 	CHECK(command.type == FLUTTER_AUDIO_CMD_LOAD);
@@ -59,6 +65,10 @@ int main(void)
 	CHECK(!flutter_parse_audio_json(large_id, strlen(large_id), &command));
 	const char *missing_path = "{\"cmd\":\"load\",\"id\":0}";
 	CHECK(!flutter_parse_audio_json(missing_path, strlen(missing_path), &command));
+	const char *missing_position = "{\"cmd\":\"seek\",\"id\":0}";
+	CHECK(!flutter_parse_audio_json(missing_position, strlen(missing_position), &command));
+	const char *negative_position = "{\"cmd\":\"seek\",\"id\":0,\"position_ms\":-1}";
+	CHECK(!flutter_parse_audio_json(negative_position, strlen(negative_position), &command));
 	CHECK(!flutter_parse_audio_json("not-json", 8, &command));
 	CHECK(!flutter_parse_audio_json("{}", 2, &command));
 

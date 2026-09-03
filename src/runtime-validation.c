@@ -6,6 +6,8 @@
 
 #include "./third_party/cjson/cJSON.h"
 
+#define FLUTTER_AUDIO_MAX_POSITION_MS 86400000.0
+
 bool flutter_checked_frame_size(uint32_t width, uint32_t height, size_t *size_out)
 {
 	if (!size_out || !width || !height || width > SIZE_MAX / 4 || height > SIZE_MAX / ((size_t)width * 4))
@@ -63,6 +65,8 @@ bool flutter_parse_audio_json(const char *data, size_t length, flutter_audio_cmd
 		output->type = FLUTTER_AUDIO_CMD_PAUSE;
 	else if (strcmp(command->valuestring, "resume") == 0)
 		output->type = FLUTTER_AUDIO_CMD_RESUME;
+	else if (strcmp(command->valuestring, "seek") == 0)
+		output->type = FLUTTER_AUDIO_CMD_SEEK;
 	else if (strcmp(command->valuestring, "stop") == 0)
 		output->type = FLUTTER_AUDIO_CMD_STOP;
 	else if (strcmp(command->valuestring, "volume") == 0)
@@ -85,6 +89,14 @@ bool flutter_parse_audio_json(const char *data, size_t length, flutter_audio_cmd
 	if (loop && !cJSON_IsBool(loop))
 		goto done;
 	output->loop = loop ? cJSON_IsTrue(loop) : false;
+
+	if (output->type == FLUTTER_AUDIO_CMD_SEEK) {
+		const cJSON *position = cJSON_GetObjectItemCaseSensitive(root, "position_ms");
+		if (!cJSON_IsNumber(position) || !isfinite(position->valuedouble) || position->valuedouble < 0.0 ||
+		    position->valuedouble > FLUTTER_AUDIO_MAX_POSITION_MS)
+			goto done;
+		output->position_ms = (uint64_t)position->valuedouble;
+	}
 
 	if (output->type == FLUTTER_AUDIO_CMD_LOAD) {
 		const cJSON *absolute_path = cJSON_GetObjectItemCaseSensitive(root, "absolute_path");

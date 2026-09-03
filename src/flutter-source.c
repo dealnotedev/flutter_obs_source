@@ -871,6 +871,15 @@ static VOID CALLBACK audio_tick(PVOID parameter, BOOLEAN timer_fired)
 			if (ctx->sounds[command.id])
 				ma_sound_start(ctx->sounds[command.id]);
 			break;
+		case FLUTTER_AUDIO_CMD_SEEK:
+			if (ctx->sounds[command.id]) {
+				const ma_result result =
+					ma_sound_seek_to_second(ctx->sounds[command.id], (float)command.position_ms / 1000.0f);
+				if (result != MA_SUCCESS)
+					blog(LOG_WARNING, "[FlutterSource] Unable to seek sound %d (miniaudio %d)",
+					     command.id, result);
+			}
+			break;
 		case FLUTTER_AUDIO_CMD_STOP:
 			if (ctx->sounds[command.id])
 				ma_sound_stop(ctx->sounds[command.id]);

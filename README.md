@@ -90,7 +90,8 @@ Future<void> loadAndPlayAudio() async {
 }
 ```
 
-Supported commands are `load`, `play`, `pause`, `resume`, `stop`, and `volume`.
+Supported commands are `load`, `play`, `pause`, `resume`, `seek`, `stop`, and
+`volume`. `seek` accepts a non-negative `position_ms` value.
 IDs must be in the range 0–255. Relative paths are resolved below
 `flutter_assets`; use the same asset path stored in the Flutter bundle
 (commonly `assets/...`).
