@@ -38,8 +38,8 @@
     },
     "name": "flutter_obs_source",
     "displayName": "Flutter OBS Source",
-    "version": "1.0.0",
-    "author": "Your Name Here",
-    "website": "https://example.com",
-    "email": "me@example.com"
+    "version": "1.1.0",
+    "author": "dealnotedev",
+    "website": "https://github.com/dealnotedev/flutter_obs_source",
+    "email": ""
 }
