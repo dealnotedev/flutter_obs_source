@@ -70,6 +70,11 @@ const audioChannel = BasicMessageChannel<String>(
   StringCodec(),
 );
 
+const audioEventsChannel = BasicMessageChannel<String>(
+  'obs_audio_events',
+  StringCodec(),
+);
+
 Future<Map<String, dynamic>> readObsConfig() async {
   final response = await configChannel.send('get_dart_config');
   return jsonDecode(response ?? '{}') as Map<String, dynamic>;
@@ -90,11 +95,16 @@ Future<void> loadAndPlayAudio() async {
 }
 ```
 
-Supported commands are `load`, `play`, `pause`, `resume`, `seek`, `stop`, and
-`volume`. `seek` accepts a non-negative `position_ms` value.
+Supported commands are `load`, `play`, `pause`, `resume`, `seek`, `stop`,
+`volume`, and `release`. `seek` accepts a non-negative `position_ms` value.
 IDs must be in the range 0–255. Relative paths are resolved below
 `flutter_assets`; use the same asset path stored in the Flutter bundle
 (commonly `assets/...`).
+
+Accepted audio commands respond with `{"ok":true,"events":true}`. Loading and
+playback then report `loaded`, `started`, `ended`, or `error` JSON messages on
+`obs_audio_events`. Pass the same optional `session_id` with `load` and `play`
+to correlate those asynchronous events with a particular playback attempt.
 
 ## Build
 

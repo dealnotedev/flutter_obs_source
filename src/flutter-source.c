@@ -43,6 +43,7 @@ typedef enum {
 	CMD_UPDATE_ENGINE,
 	CMD_SET_ACTIVE,
 	CMD_MOUSE_INPUT,
+	CMD_AUDIO_EVENT,
 } command_type_t;
 
 typedef struct command {
@@ -61,6 +62,7 @@ typedef struct command {
 	bool active;
 	char *dart_config;
 	flutter_mouse_input mouse_input;
+	char *audio_event;
 } command_t;
 
 typedef struct {
@@ -87,6 +89,23 @@ typedef struct {
 	uint64_t generation;
 	frame_slot_state state;
 } frame_slot;
+
+typedef enum {
+	AUDIO_SOUND_EMPTY,
+	AUDIO_SOUND_LOADING,
+	AUDIO_SOUND_READY,
+	AUDIO_SOUND_PLAYING,
+	AUDIO_SOUND_PAUSED,
+} audio_sound_phase;
+
+typedef struct {
+	ma_sound *sound;
+	audio_sound_phase phase;
+	bool play_pending;
+	float volume;
+	bool loop;
+	char session_id[FLUTTER_AUDIO_SESSION_CAPACITY];
+} audio_sound_slot;
 
 struct flutter_source {
 	obs_source_t *source;
@@ -125,7 +144,7 @@ struct flutter_source {
 	uint32_t audio_tail;
 	ma_engine ma;
 	bool ma_initialized;
-	ma_sound *sounds[MAX_SOUNDS];
+	audio_sound_slot sounds[MAX_SOUNDS];
 	HANDLE audio_timer;
 	float *mix_interleaved;
 	float *mix_left;
@@ -183,6 +202,7 @@ static void command_destroy(command_t *command)
 	if (!command)
 		return;
 	free(command->dart_config);
+	free(command->audio_event);
 	free(command);
 }
 
@@ -509,11 +529,16 @@ static void platform_message_cb(const FlutterPlatformMessage *message, void *use
 			send_platform_response(ctx, message, "{\"ok\":false,\"error\":\"invalid_command\"}");
 			return;
 		}
+		if ((command.type == FLUTTER_AUDIO_CMD_LOAD || command.type == FLUTTER_AUDIO_CMD_PLAY) &&
+		    !ctx->ma_initialized) {
+			send_platform_response(ctx, message, "{\"ok\":false,\"error\":\"audio_unavailable\"}");
+			return;
+		}
 		if (!audio_queue_push(ctx, &command)) {
 			send_platform_response(ctx, message, "{\"ok\":false,\"error\":\"queue_full\"}");
 			return;
 		}
-		send_platform_response(ctx, message, "{\"ok\":true}");
+		send_platform_response(ctx, message, "{\"ok\":true,\"events\":true}");
 		return;
 	}
 
@@ -562,6 +587,25 @@ static bool send_message_to_dart(struct flutter_source *ctx, const char *channel
 	const FlutterEngineResult result = FlutterEngineSendPlatformMessage(ctx->engine, &message);
 	log_flutter_result("FlutterEngineSendPlatformMessage", result);
 	return result == kSuccess;
+}
+
+static void enqueue_audio_event(struct flutter_source *ctx, const char *event, int id, const char *session_id,
+				const char *message)
+{
+	char *payload = flutter_create_audio_event_json(event, id, session_id, message);
+	if (!payload) {
+		blog(LOG_ERROR, "[FlutterSource] Unable to format audio event %s for sound %d", event, id);
+		return;
+	}
+
+	command_t *command = command_create(CMD_AUDIO_EVENT);
+	if (!command) {
+		free(payload);
+		return;
+	}
+	command->audio_event = payload;
+	if (!worker_queue_push(&ctx->worker_queue, command, false))
+		command_destroy(command);
 }
 
 static bool engine_init(struct flutter_source *ctx)
@@ -736,6 +780,10 @@ static DWORD WINAPI worker_thread_fn(LPVOID parameter)
 		case CMD_MOUSE_INPUT:
 			engine_handle_mouse_input(ctx, &command->mouse_input);
 			break;
+		case CMD_AUDIO_EVENT:
+			if (ctx->engine)
+				send_message_to_dart(ctx, "obs_audio_events", command->audio_event);
+			break;
 		}
 
 		if (command->done_event)
@@ -787,15 +835,20 @@ static bool initialize_audio(struct flutter_source *ctx)
 	return true;
 }
 
+static void reset_audio_slot(audio_sound_slot *slot)
+{
+	if (slot->sound) {
+		ma_sound_uninit(slot->sound);
+		free(slot->sound);
+	}
+	memset(slot, 0, sizeof(*slot));
+	slot->volume = 1.0f;
+}
+
 static void uninitialize_audio(struct flutter_source *ctx)
 {
-	for (int i = 0; i < MAX_SOUNDS; ++i) {
-		if (ctx->sounds[i]) {
-			ma_sound_uninit(ctx->sounds[i]);
-			free(ctx->sounds[i]);
-			ctx->sounds[i] = NULL;
-		}
-	}
+	for (int i = 0; i < MAX_SOUNDS; ++i)
+		reset_audio_slot(&ctx->sounds[i]);
 	if (ctx->ma_initialized) {
 		ma_engine_uninit(&ctx->ma);
 		ctx->ma_initialized = false;
@@ -808,6 +861,185 @@ static void uninitialize_audio(struct flutter_source *ctx)
 	ctx->mix_right = NULL;
 }
 
+static void enqueue_audio_error(struct flutter_source *ctx, int id, const char *session_id, const char *operation,
+				ma_result result)
+{
+	char message[256];
+	snprintf(message, sizeof(message), "%s failed: %s (%d)", operation, ma_result_description(result), result);
+	blog(LOG_ERROR, "[FlutterSource] Sound %d: %s", id, message);
+	enqueue_audio_event(ctx, "error", id, session_id, message);
+}
+
+static ma_result audio_slot_ready(audio_sound_slot *slot, bool *ready)
+{
+	*ready = false;
+	ma_data_source *data_source = ma_sound_get_data_source(slot->sound);
+	if (!data_source)
+		return MA_INVALID_OPERATION;
+
+	ma_resource_manager_data_source *resource = (ma_resource_manager_data_source *)data_source;
+	const ma_result result = ma_resource_manager_data_source_result(resource);
+	if (result == MA_SUCCESS) {
+		*ready = true;
+		return MA_SUCCESS;
+	}
+	if (result != MA_BUSY)
+		return result;
+
+	ma_uint64 available_frames = 0;
+	const ma_result available_result =
+		ma_resource_manager_data_source_get_available_frames(resource, &available_frames);
+	if (available_result == MA_SUCCESS && available_frames > 0) {
+		*ready = true;
+		return MA_SUCCESS;
+	}
+	return available_result == MA_SUCCESS ? MA_BUSY : available_result;
+}
+
+static bool start_audio_slot(struct flutter_source *ctx, int id, audio_sound_slot *slot)
+{
+	ma_sound_set_volume(slot->sound, slot->volume);
+	ma_sound_set_looping(slot->sound, slot->loop);
+	const ma_result result = ma_sound_start(slot->sound);
+	if (result != MA_SUCCESS) {
+		slot->play_pending = false;
+		slot->phase = AUDIO_SOUND_READY;
+		enqueue_audio_error(ctx, id, slot->session_id, "start", result);
+		return false;
+	}
+
+	slot->play_pending = false;
+	slot->phase = AUDIO_SOUND_PLAYING;
+	enqueue_audio_event(ctx, "started", id, slot->session_id, NULL);
+	return true;
+}
+
+static void poll_audio_slots(struct flutter_source *ctx)
+{
+	for (int id = 0; id < MAX_SOUNDS; ++id) {
+		audio_sound_slot *slot = &ctx->sounds[id];
+		if (slot->phase == AUDIO_SOUND_LOADING) {
+			bool ready = false;
+			const ma_result result = audio_slot_ready(slot, &ready);
+			if (result != MA_SUCCESS && result != MA_BUSY) {
+				char session_id[FLUTTER_AUDIO_SESSION_CAPACITY];
+				copy_string(session_id, sizeof(session_id), slot->session_id, "audio session ID");
+				reset_audio_slot(slot);
+				enqueue_audio_error(ctx, id, session_id, "load", result);
+				continue;
+			}
+			if (!ready)
+				continue;
+
+			slot->phase = AUDIO_SOUND_READY;
+			enqueue_audio_event(ctx, "loaded", id, slot->session_id, NULL);
+			if (slot->play_pending)
+				start_audio_slot(ctx, id, slot);
+		} else if (slot->phase == AUDIO_SOUND_PLAYING && !slot->loop && ma_sound_at_end(slot->sound)) {
+			slot->phase = AUDIO_SOUND_READY;
+			enqueue_audio_event(ctx, "ended", id, slot->session_id, NULL);
+		}
+	}
+}
+
+static void process_audio_command(struct flutter_source *ctx, const flutter_audio_cmd *command)
+{
+	audio_sound_slot *slot = &ctx->sounds[command->id];
+	switch (command->type) {
+	case FLUTTER_AUDIO_CMD_LOAD: {
+		reset_audio_slot(slot);
+		copy_string(slot->session_id, sizeof(slot->session_id), command->session_id, "audio session ID");
+
+		char full_path[PATH_CAPACITY];
+		const int written = command->is_relative
+				    ? snprintf(full_path, sizeof(full_path), "%s\\%s", ctx->assets_dir, command->path)
+				    : snprintf(full_path, sizeof(full_path), "%s", command->path);
+		if (written < 0 || (size_t)written >= sizeof(full_path)) {
+			blog(LOG_ERROR, "[FlutterSource] Audio path is too long");
+			enqueue_audio_event(ctx, "error", command->id, slot->session_id, "Audio path is too long");
+			break;
+		}
+
+		ma_sound *sound = calloc(1, sizeof(*sound));
+		if (!sound) {
+			blog(LOG_ERROR, "[FlutterSource] Unable to allocate sound %d", command->id);
+			enqueue_audio_event(ctx, "error", command->id, slot->session_id,
+					    "Unable to allocate native sound");
+			break;
+		}
+		const ma_result result = ma_sound_init_from_file(&ctx->ma, full_path,
+						       MA_SOUND_FLAG_DECODE | MA_SOUND_FLAG_ASYNC, NULL, NULL, sound);
+		if (result != MA_SUCCESS) {
+			free(sound);
+			enqueue_audio_error(ctx, command->id, slot->session_id, "load", result);
+			break;
+		}
+		slot->sound = sound;
+		slot->phase = AUDIO_SOUND_LOADING;
+		break;
+	}
+	case FLUTTER_AUDIO_CMD_PLAY:
+		slot->volume = command->volume;
+		slot->loop = command->loop;
+		if (!slot->sound) {
+			if (command->session_id[0])
+				copy_string(slot->session_id, sizeof(slot->session_id), command->session_id,
+					    "audio session ID");
+			enqueue_audio_event(ctx, "error", command->id, slot->session_id, "Sound is not loaded");
+		} else if (slot->phase == AUDIO_SOUND_LOADING) {
+			if (command->session_id[0])
+				copy_string(slot->session_id, sizeof(slot->session_id), command->session_id,
+					    "audio session ID");
+			slot->play_pending = true;
+		} else if (slot->phase == AUDIO_SOUND_PLAYING) {
+			ma_sound_set_volume(slot->sound, slot->volume);
+			ma_sound_set_looping(slot->sound, slot->loop);
+		} else {
+			if (command->session_id[0])
+				copy_string(slot->session_id, sizeof(slot->session_id), command->session_id,
+					    "audio session ID");
+			start_audio_slot(ctx, command->id, slot);
+		}
+		break;
+	case FLUTTER_AUDIO_CMD_PAUSE:
+		if (slot->sound && slot->phase == AUDIO_SOUND_LOADING) {
+			slot->play_pending = false;
+		} else if (slot->sound && slot->phase == AUDIO_SOUND_PLAYING) {
+			ma_sound_stop(slot->sound);
+			slot->phase = AUDIO_SOUND_PAUSED;
+		}
+		break;
+	case FLUTTER_AUDIO_CMD_RESUME:
+		if (slot->sound && slot->phase == AUDIO_SOUND_PAUSED)
+			start_audio_slot(ctx, command->id, slot);
+		break;
+	case FLUTTER_AUDIO_CMD_SEEK:
+		if (slot->sound) {
+			const ma_result result =
+				ma_sound_seek_to_second(slot->sound, (float)command->position_ms / 1000.0f);
+			if (result != MA_SUCCESS)
+				enqueue_audio_error(ctx, command->id, slot->session_id, "seek", result);
+		}
+		break;
+	case FLUTTER_AUDIO_CMD_STOP:
+		if (slot->sound) {
+			ma_sound_stop(slot->sound);
+			slot->play_pending = false;
+			if (slot->phase != AUDIO_SOUND_LOADING)
+				slot->phase = AUDIO_SOUND_READY;
+		}
+		break;
+	case FLUTTER_AUDIO_CMD_VOLUME:
+		slot->volume = command->volume;
+		if (slot->sound)
+			ma_sound_set_volume(slot->sound, slot->volume);
+		break;
+	case FLUTTER_AUDIO_CMD_RELEASE:
+		reset_audio_slot(slot);
+		break;
+	}
+}
+
 static VOID CALLBACK audio_tick(PVOID parameter, BOOLEAN timer_fired)
 {
 	(void)timer_fired;
@@ -818,78 +1050,10 @@ static VOID CALLBACK audio_tick(PVOID parameter, BOOLEAN timer_fired)
 
 	flutter_audio_cmd command;
 	while (audio_queue_pop(ctx, &command)) {
-		if (command.id < 0 || command.id >= MAX_SOUNDS)
-			continue;
-
-		switch (command.type) {
-		case FLUTTER_AUDIO_CMD_LOAD: {
-			if (!ctx->ma_initialized)
-				break;
-			if (ctx->sounds[command.id]) {
-				ma_sound_uninit(ctx->sounds[command.id]);
-				free(ctx->sounds[command.id]);
-				ctx->sounds[command.id] = NULL;
-			}
-
-			char full_path[PATH_CAPACITY];
-			const int written = command.is_relative
-					    ? snprintf(full_path, sizeof(full_path), "%s\\%s", ctx->assets_dir, command.path)
-					    : snprintf(full_path, sizeof(full_path), "%s", command.path);
-			if (written < 0 || (size_t)written >= sizeof(full_path)) {
-				blog(LOG_ERROR, "[FlutterSource] Audio path is too long");
-				break;
-			}
-
-			ma_sound *sound = calloc(1, sizeof(*sound));
-			if (!sound) {
-				blog(LOG_ERROR, "[FlutterSource] Unable to allocate sound %d", command.id);
-				break;
-			}
-			const ma_result result = ma_sound_init_from_file(&ctx->ma, full_path,
-							       MA_SOUND_FLAG_DECODE | MA_SOUND_FLAG_ASYNC, NULL, NULL,
-							       sound);
-			if (result != MA_SUCCESS) {
-				blog(LOG_ERROR, "[FlutterSource] Unable to load %s (miniaudio %d)", full_path, result);
-				free(sound);
-			} else {
-				ctx->sounds[command.id] = sound;
-			}
-			break;
-		}
-		case FLUTTER_AUDIO_CMD_PLAY:
-			if (ctx->sounds[command.id]) {
-				ma_sound_set_volume(ctx->sounds[command.id], command.volume);
-				ma_sound_set_looping(ctx->sounds[command.id], command.loop);
-				ma_sound_start(ctx->sounds[command.id]);
-			}
-			break;
-		case FLUTTER_AUDIO_CMD_PAUSE:
-			if (ctx->sounds[command.id])
-				ma_sound_stop(ctx->sounds[command.id]);
-			break;
-		case FLUTTER_AUDIO_CMD_RESUME:
-			if (ctx->sounds[command.id])
-				ma_sound_start(ctx->sounds[command.id]);
-			break;
-		case FLUTTER_AUDIO_CMD_SEEK:
-			if (ctx->sounds[command.id]) {
-				const ma_result result =
-					ma_sound_seek_to_second(ctx->sounds[command.id], (float)command.position_ms / 1000.0f);
-				if (result != MA_SUCCESS)
-					blog(LOG_WARNING, "[FlutterSource] Unable to seek sound %d (miniaudio %d)",
-					     command.id, result);
-			}
-			break;
-		case FLUTTER_AUDIO_CMD_STOP:
-			if (ctx->sounds[command.id])
-				ma_sound_stop(ctx->sounds[command.id]);
-			break;
-		case FLUTTER_AUDIO_CMD_VOLUME:
-			if (ctx->sounds[command.id])
-				ma_sound_set_volume(ctx->sounds[command.id], command.volume);
-			break;
-		}
+		if (command.id >= 0 && command.id < MAX_SOUNDS)
+			process_audio_command(ctx, &command);
 	}
+	poll_audio_slots(ctx);
 
 	if (ctx->ma_initialized && InterlockedCompareExchange(&ctx->active, 0, 0)) {
 		if (InterlockedExchange(&ctx->audio_reanchor, 0))
@@ -1021,7 +1185,12 @@ static void *source_create(obs_data_t *settings, obs_source_t *source)
 	copy_string(ctx->requested_dart_config, sizeof(ctx->requested_dart_config), normalized_config, "Dart config");
 	copy_string(ctx->dart_config, sizeof(ctx->dart_config), ctx->requested_dart_config, "Dart config");
 
-	initialize_audio(ctx);
+	if (initialize_audio(ctx) &&
+	    !CreateTimerQueueTimer(&ctx->audio_timer, NULL, audio_tick, ctx, 0, 20, WT_EXECUTEDEFAULT)) {
+		blog(LOG_ERROR, "[FlutterSource] CreateTimerQueueTimer failed (%lu); audio is disabled", GetLastError());
+		ctx->audio_timer = NULL;
+		uninitialize_audio(ctx);
+	}
 	ctx->worker_thread = CreateThread(NULL, 0, worker_thread_fn, ctx, 0, &ctx->engine_tid);
 	if (!ctx->worker_thread) {
 		blog(LOG_ERROR, "[FlutterSource] CreateThread failed (%lu)", GetLastError());
@@ -1040,11 +1209,6 @@ static void *source_create(obs_data_t *settings, obs_source_t *source)
 		return NULL;
 	}
 
-	if (ctx->ma_initialized &&
-	    !CreateTimerQueueTimer(&ctx->audio_timer, NULL, audio_tick, ctx, 0, 20, WT_EXECUTEDEFAULT)) {
-		blog(LOG_ERROR, "[FlutterSource] CreateTimerQueueTimer failed (%lu); audio is disabled", GetLastError());
-		ctx->audio_timer = NULL;
-	}
 	return ctx;
 }
 

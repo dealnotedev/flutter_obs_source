@@ -1,8 +1,10 @@
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "runtime-validation.h"
+#include "third_party/cjson/cJSON.h"
 
 #define CHECK(condition)                                                                                              \
 	do {                                                                                                           \
@@ -55,9 +57,42 @@ int main(void)
 	CHECK(command.is_relative);
 	CHECK(strcmp(command.path, "assets/sound.wav") == 0);
 
+	const char *load_with_session =
+		"{\"cmd\":\"load\",\"id\":2,\"asset\":\"assets/sound.wav\",\"session_id\":\"track-2\"}";
+	CHECK(flutter_parse_audio_json(load_with_session, strlen(load_with_session), &command));
+	CHECK(strcmp(command.session_id, "track-2") == 0);
+
+	char *event_json = flutter_create_audio_event_json("error", 2, "track-2", "decode failed");
+	CHECK(event_json);
+	cJSON *event = cJSON_Parse(event_json);
+	free(event_json);
+	CHECK(event);
+	CHECK(strcmp(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(event, "event")), "error") == 0);
+	CHECK(cJSON_GetNumberValue(cJSON_GetObjectItemCaseSensitive(event, "id")) == 2);
+	CHECK(strcmp(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(event, "session_id")), "track-2") == 0);
+	CHECK(strcmp(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(event, "message")), "decode failed") == 0);
+	cJSON_Delete(event);
+
+	char escaped_session[FLUTTER_AUDIO_SESSION_CAPACITY];
+	memset(escaped_session, 1, sizeof(escaped_session) - 1);
+	escaped_session[sizeof(escaped_session) - 1] = '\0';
+	event_json = flutter_create_audio_event_json("loaded", 2, escaped_session, NULL);
+	CHECK(event_json);
+	event = cJSON_Parse(event_json);
+	free(event_json);
+	CHECK(event);
+	CHECK(strlen(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(event, "session_id"))) ==
+	      sizeof(escaped_session) - 1);
+	cJSON_Delete(event);
+	CHECK(!flutter_create_audio_event_json("progress", 2, "track-2", NULL));
+
 	const char *clamped = "{\"cmd\":\"volume\",\"id\":2,\"volume\":99}";
 	CHECK(flutter_parse_audio_json(clamped, strlen(clamped), &command));
 	CHECK(command.volume == 4.0f);
+
+	const char *release = "{\"cmd\":\"release\",\"id\":2}";
+	CHECK(flutter_parse_audio_json(release, strlen(release), &command));
+	CHECK(command.type == FLUTTER_AUDIO_CMD_RELEASE);
 
 	const char *negative_id = "{\"cmd\":\"play\",\"id\":-1}";
 	CHECK(!flutter_parse_audio_json(negative_id, strlen(negative_id), &command));

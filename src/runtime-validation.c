@@ -2,6 +2,7 @@
 
 #include <limits.h>
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "./third_party/cjson/cJSON.h"
@@ -27,7 +28,7 @@ uint32_t flutter_normalize_setting(int64_t value, uint32_t fallback, uint32_t mi
 	return (uint32_t)value;
 }
 
-static bool copy_path(char *destination, size_t capacity, const char *source)
+static bool copy_string(char *destination, size_t capacity, const char *source)
 {
 	const size_t length = strlen(source);
 	if (length >= capacity)
@@ -71,8 +72,17 @@ bool flutter_parse_audio_json(const char *data, size_t length, flutter_audio_cmd
 		output->type = FLUTTER_AUDIO_CMD_STOP;
 	else if (strcmp(command->valuestring, "volume") == 0)
 		output->type = FLUTTER_AUDIO_CMD_VOLUME;
+	else if (strcmp(command->valuestring, "release") == 0)
+		output->type = FLUTTER_AUDIO_CMD_RELEASE;
 	else
 		goto done;
+
+	const cJSON *session_id = cJSON_GetObjectItemCaseSensitive(root, "session_id");
+	if (session_id) {
+		if (!cJSON_IsString(session_id) || !session_id->valuestring ||
+		    !copy_string(output->session_id, sizeof(output->session_id), session_id->valuestring))
+			goto done;
+	}
 
 	const cJSON *volume = cJSON_GetObjectItemCaseSensitive(root, "volume");
 	if (volume) {
@@ -102,11 +112,11 @@ bool flutter_parse_audio_json(const char *data, size_t length, flutter_audio_cmd
 		const cJSON *absolute_path = cJSON_GetObjectItemCaseSensitive(root, "absolute_path");
 		const cJSON *asset = cJSON_GetObjectItemCaseSensitive(root, "asset");
 		if (cJSON_IsString(absolute_path) && absolute_path->valuestring && absolute_path->valuestring[0]) {
-			if (!copy_path(output->path, sizeof(output->path), absolute_path->valuestring))
+			if (!copy_string(output->path, sizeof(output->path), absolute_path->valuestring))
 				goto done;
 			output->is_relative = false;
 		} else if (cJSON_IsString(asset) && asset->valuestring && asset->valuestring[0]) {
-			if (!copy_path(output->path, sizeof(output->path), asset->valuestring))
+			if (!copy_string(output->path, sizeof(output->path), asset->valuestring))
 				goto done;
 			output->is_relative = true;
 		} else {
@@ -119,4 +129,40 @@ bool flutter_parse_audio_json(const char *data, size_t length, flutter_audio_cmd
 done:
 	cJSON_Delete(root);
 	return valid;
+}
+
+static bool is_audio_event(const char *event)
+{
+	return event && (strcmp(event, "loaded") == 0 || strcmp(event, "started") == 0 ||
+			 strcmp(event, "ended") == 0 || strcmp(event, "error") == 0);
+}
+
+char *flutter_create_audio_event_json(const char *event, int id, const char *session_id, const char *message)
+{
+	if (!is_audio_event(event) || id < 0 || id >= FLUTTER_MAX_SOUNDS)
+		return NULL;
+
+	cJSON *root = cJSON_CreateObject();
+	if (!root)
+		return NULL;
+
+	bool valid = cJSON_AddStringToObject(root, "event", event) != NULL &&
+		     cJSON_AddNumberToObject(root, "id", id) != NULL;
+	if (valid && session_id && session_id[0])
+		valid = cJSON_AddStringToObject(root, "session_id", session_id) != NULL;
+	if (valid && message && message[0])
+		valid = cJSON_AddStringToObject(root, "message", message) != NULL;
+
+	char *result = NULL;
+	char *encoded = valid ? cJSON_PrintUnformatted(root) : NULL;
+	if (encoded) {
+		const size_t length = strlen(encoded);
+		result = malloc(length + 1);
+		if (result)
+			memcpy(result, encoded, length + 1);
+		cJSON_free(encoded);
+	}
+
+	cJSON_Delete(root);
+	return result;
 }
