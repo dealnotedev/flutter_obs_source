@@ -22,6 +22,8 @@
 
 #include "flutter_embedder.h"
 #include "flutter-mouse.h"
+#include "flutter-keyboard.h"
+#include "flutter-text-input.h"
 #include "runtime-validation.h"
 #include "./third_party/cjson/cJSON.h"
 #include "./third_party/miniaudio/miniaudio.h"
@@ -43,6 +45,7 @@ typedef enum {
 	CMD_UPDATE_ENGINE,
 	CMD_SET_ACTIVE,
 	CMD_MOUSE_INPUT,
+	CMD_KEY_INPUT,
 	CMD_AUDIO_EVENT,
 } command_type_t;
 
@@ -62,8 +65,19 @@ typedef struct command {
 	bool active;
 	char *dart_config;
 	flutter_mouse_input mouse_input;
+	flutter_key_input key_input;
 	char *audio_event;
 } command_t;
+
+typedef struct pending_key {
+	struct pending_key *next;
+	struct flutter_source *source;
+	flutter_key_input input;
+	uint64_t focus_generation;
+	uint64_t client_generation;
+	bool key_data_handled;
+	char raw_message[FLUTTER_KEY_RAW_MESSAGE_CAPACITY];
+} pending_key;
 
 typedef struct {
 	CRITICAL_SECTION cs;
@@ -137,6 +151,11 @@ struct flutter_source {
 	char dart_config[DART_CONFIG_CAPACITY];
 	char assets_dir[PATH_CAPACITY];
 	flutter_mouse_state mouse_state;
+	flutter_keyboard_state keyboard_state;
+	flutter_text_input text_input;
+	pending_key *key_head;
+	pending_key *key_tail;
+	uint64_t keyboard_focus_generation;
 
 	CRITICAL_SECTION audio_cs;
 	flutter_audio_cmd audio_queue[AUDIO_QUEUE_SIZE];
@@ -203,12 +222,16 @@ static void command_destroy(command_t *command)
 		return;
 	free(command->dart_config);
 	free(command->audio_event);
+	free((void *)command->key_input.text);
 	free(command);
 }
 
 static uint64_t command_due_time(const command_t *command)
 {
-	return command->type == CMD_RUN_ENGINE_TASK || command->type == CMD_MOUSE_INPUT ? command->target_time_ns : 0;
+	return command->type == CMD_RUN_ENGINE_TASK || command->type == CMD_MOUSE_INPUT ||
+			       command->type == CMD_KEY_INPUT
+		       ? command->target_time_ns
+		       : 0;
 }
 
 static void worker_queue_init(worker_queue_t *queue)
@@ -262,6 +285,8 @@ static bool worker_queue_push_mouse(worker_queue_t *queue, command_t *command)
 		while (*position) {
 			if ((*position)->type == CMD_MOUSE_INPUT)
 				last_mouse_position = position;
+			else if ((*position)->type == CMD_KEY_INPUT)
+				last_mouse_position = NULL;
 			position = &(*position)->next;
 		}
 		if (last_mouse_position && (*last_mouse_position)->mouse_input.type == FLUTTER_MOUSE_INPUT_MOVE) {
@@ -515,6 +540,17 @@ static void platform_message_cb(const FlutterPlatformMessage *message, void *use
 	if (!ctx || !message || !message->channel || !ctx->engine)
 		return;
 
+	if (strcmp(message->channel, "flutter/textinput") == 0 || strcmp(message->channel, "flutter/platform") == 0) {
+		char *response = strcmp(message->channel, "flutter/textinput") == 0
+					 ? flutter_text_input_handle(&ctx->text_input, (const char *)message->message,
+								     message->message_size)
+					 : flutter_clipboard_handle(&ctx->text_input, (const char *)message->message,
+								    message->message_size);
+		send_platform_response(ctx, message, response);
+		free(response);
+		return;
+	}
+
 	if (strcmp(message->channel, "obs_config") == 0) {
 		if (platform_message_equals(message, "get_dart_config"))
 			send_platform_response(ctx, message, ctx->dart_config);
@@ -587,6 +623,140 @@ static bool send_message_to_dart(struct flutter_source *ctx, const char *channel
 	const FlutterEngineResult result = FlutterEngineSendPlatformMessage(ctx->engine, &message);
 	log_flutter_result("FlutterEngineSendPlatformMessage", result);
 	return result == kSuccess;
+}
+
+static void send_text_message(const char *message, void *user_data)
+{
+	send_message_to_dart(user_data, "flutter/textinput", message);
+}
+
+static void pop_pending_key(struct flutter_source *ctx)
+{
+	pending_key *key = ctx->key_head;
+	ctx->key_head = key->next;
+	if (!ctx->key_head)
+		ctx->key_tail = NULL;
+	free((void *)key->input.text);
+	free(key);
+}
+
+static void dispatch_pending_keys(struct flutter_source *ctx);
+
+static void key_event_complete(bool handled, void *user_data)
+{
+	pending_key *key = user_data;
+	struct flutter_source *ctx = key->source;
+	if (!InterlockedCompareExchange(&ctx->shutting_down, 0, 0) && !handled && !key->input.key_up &&
+	    key->focus_generation == ctx->keyboard_focus_generation &&
+	    key->client_generation == ctx->text_input.generation) {
+		flutter_text_input_key(&ctx->text_input, key->input.virtual_key, key->input.modifiers, key->input.text,
+				       send_text_message, ctx);
+	}
+	pop_pending_key(ctx);
+	dispatch_pending_keys(ctx);
+}
+
+static void raw_key_event_complete(const uint8_t *data, size_t size, void *user_data)
+{
+	pending_key *key = user_data;
+	cJSON *reply = data && size ? cJSON_ParseWithLength((const char *)data, size) : NULL;
+	const bool handled = key->key_data_handled || cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(reply, "handled"));
+	cJSON_Delete(reply);
+	key_event_complete(handled, key);
+}
+
+static void key_data_complete(bool handled, void *user_data)
+{
+	pending_key *key = user_data;
+	struct flutter_source *ctx = key->source;
+	key->key_data_handled = handled;
+	if (InterlockedCompareExchange(&ctx->shutting_down, 0, 0)) {
+		key_event_complete(true, key);
+		return;
+	}
+	// Send the raw companion only after the modern key data has reached Dart.
+	// Its response contains the actual Focus/Shortcuts handled result.
+	FlutterPlatformMessageResponseHandle *response = NULL;
+	FlutterEngineResult result = FlutterPlatformMessageCreateResponseHandle(ctx->engine, raw_key_event_complete,
+									      key, &response);
+	log_flutter_result("FlutterPlatformMessageCreateResponseHandle", result);
+	if (result != kSuccess) {
+		key_event_complete(true, key);
+		return;
+	}
+	const FlutterPlatformMessage message = {
+		.struct_size = sizeof(message),
+		.channel = "flutter/keyevent",
+		.message = (const uint8_t *)key->raw_message,
+		.message_size = strlen(key->raw_message),
+		.response_handle = response,
+	};
+	result = FlutterEngineSendPlatformMessage(ctx->engine, &message);
+	log_flutter_result("FlutterEngineSendPlatformMessage(keyevent)", result);
+	log_flutter_result("FlutterPlatformMessageReleaseResponseHandle",
+			   FlutterPlatformMessageReleaseResponseHandle(ctx->engine, response));
+	if (result != kSuccess)
+		key_event_complete(true, key);
+}
+
+static void dispatch_pending_keys(struct flutter_source *ctx)
+{
+	// Let Flutter finish each key (and any resulting text edit) before sending
+	// the next one. Engine tasks continue running while a response is pending.
+	while (ctx->key_head && !InterlockedCompareExchange(&ctx->shutting_down, 0, 0)) {
+		pending_key *key = ctx->key_head;
+		if (key->focus_generation != ctx->keyboard_focus_generation) {
+			pop_pending_key(ctx);
+			continue;
+		}
+		flutter_key_output output;
+		flutter_keyboard_translate(&ctx->keyboard_state, &key->input, &output);
+		key->client_generation = ctx->text_input.generation;
+		memcpy(key->raw_message, output.raw_message, sizeof(key->raw_message));
+		for (size_t i = 0; i < output.count; ++i) {
+			const FlutterKeyEvent *event = &output.events[i];
+			const FlutterEngineResult result = FlutterEngineSendKeyEvent(
+				ctx->engine, event, event->synthesized ? NULL : key_data_complete,
+				event->synthesized ? NULL : key);
+			log_flutter_result("FlutterEngineSendKeyEvent", result);
+			if (!event->synthesized && result == kSuccess)
+				return;
+		}
+		pop_pending_key(ctx);
+	}
+}
+
+static void engine_handle_key_input(struct flutter_source *ctx, const flutter_key_input *input)
+{
+	if (!ctx->engine || (ctx->mouse_state.focus_known && !ctx->mouse_state.focused))
+		return;
+	pending_key *key = calloc(1, sizeof(*key));
+	if (!key)
+		return;
+	key->source = ctx;
+	key->input = *input;
+	key->input.text = duplicate_string(input->text ? input->text : "");
+	key->focus_generation = ctx->keyboard_focus_generation;
+	if (!key->input.text) {
+		free(key);
+		return;
+	}
+	if (ctx->key_tail) {
+		ctx->key_tail->next = key;
+		ctx->key_tail = key;
+	} else {
+		ctx->key_head = ctx->key_tail = key;
+		dispatch_pending_keys(ctx);
+	}
+}
+
+static void engine_release_keyboard(struct flutter_source *ctx, uint64_t timestamp_us)
+{
+	ctx->keyboard_focus_generation++;
+	FlutterKeyEvent event;
+	while (flutter_keyboard_release_next(&ctx->keyboard_state, timestamp_us, &event))
+		log_flutter_result("FlutterEngineSendKeyEvent",
+				   FlutterEngineSendKeyEvent(ctx->engine, &event, NULL, NULL));
 }
 
 static void enqueue_audio_event(struct flutter_source *ctx, const char *event, int id, const char *session_id,
@@ -701,6 +871,9 @@ static void engine_shutdown(struct flutter_source *ctx)
 		log_flutter_result("FlutterEngineShutdown", FlutterEngineShutdown(ctx->engine));
 		ctx->engine = NULL;
 	}
+	while (ctx->key_head)
+		pop_pending_key(ctx);
+	flutter_text_input_destroy(&ctx->text_input);
 	if (ctx->aot_data) {
 		log_flutter_result("FlutterEngineCollectAOTData", FlutterEngineCollectAOTData(ctx->aot_data));
 		ctx->aot_data = NULL;
@@ -734,6 +907,8 @@ static void engine_handle_mouse_input(struct flutter_source *ctx, const flutter_
 {
 	if (!ctx->engine)
 		return;
+	if (input->type == FLUTTER_MOUSE_INPUT_FOCUS && !input->focused)
+		engine_release_keyboard(ctx, input->timestamp_us);
 
 	flutter_mouse_output output;
 	flutter_mouse_translate(&ctx->mouse_state, input, &output);
@@ -779,6 +954,9 @@ static DWORD WINAPI worker_thread_fn(LPVOID parameter)
 			break;
 		case CMD_MOUSE_INPUT:
 			engine_handle_mouse_input(ctx, &command->mouse_input);
+			break;
+		case CMD_KEY_INPUT:
+			engine_handle_key_input(ctx, &command->key_input);
 			break;
 		case CMD_AUDIO_EVENT:
 			if (ctx->engine)
@@ -1172,6 +1350,8 @@ static void *source_create(obs_data_t *settings, obs_source_t *source)
 	InitializeCriticalSection(&ctx->audio_cs);
 	worker_queue_init(&ctx->worker_queue);
 	flutter_mouse_state_init(&ctx->mouse_state);
+	flutter_keyboard_init(&ctx->keyboard_state);
+	flutter_text_input_init(&ctx->text_input);
 
 	ctx->width = flutter_normalize_setting(obs_data_get_int(settings, "width"), 640, 320, 3840);
 	ctx->height = flutter_normalize_setting(obs_data_get_int(settings, "height"), 480, 240, 2160);
@@ -1527,9 +1707,56 @@ static void source_mouse_wheel(void *data, const struct obs_mouse_event *event, 
 static void source_focus(void *data, bool focus)
 {
 	enqueue_mouse_input(data, (flutter_mouse_input){
-		.type = FLUTTER_MOUSE_INPUT_FOCUS,
-		.focused = focus,
-	});
+					  .type = FLUTTER_MOUSE_INPUT_FOCUS,
+					  .focused = focus,
+				  });
+}
+
+static uint32_t keyboard_modifiers_from_obs(const struct obs_key_event *event)
+{
+	uint32_t modifiers = 0;
+	const int keys[] = {VK_LSHIFT, VK_RSHIFT, VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU, VK_LWIN, VK_RWIN};
+	for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i)
+		if (GetKeyState(keys[i]) & 0x8000)
+			modifiers |= 1u << i;
+	// OBS 31 omits Windows, CapsLock and NumLock flags. Preserve the native
+	// snapshot and supplement it with aggregate flags for injected events.
+	const uint32_t obs_flags[] = {INTERACT_SHIFT_KEY, INTERACT_CONTROL_KEY, INTERACT_ALT_KEY, INTERACT_COMMAND_KEY};
+	for (size_t i = 0; i < sizeof(obs_flags) / sizeof(obs_flags[0]); ++i) {
+		const uint32_t pair = 3u << (i * 2);
+		if ((event->modifiers & obs_flags[i]) && !(modifiers & pair))
+			modifiers |= 1u << (i * 2);
+	}
+	if ((GetKeyState(VK_CAPITAL) & 1) || (event->modifiers & INTERACT_CAPS_KEY))
+		modifiers |= FLUTTER_KEY_CAPS_LOCK;
+	if ((GetKeyState(VK_NUMLOCK) & 1) || (event->modifiers & INTERACT_NUMLOCK_KEY))
+		modifiers |= FLUTTER_KEY_NUM_LOCK;
+	if (GetKeyState(VK_SCROLL) & 1)
+		modifiers |= FLUTTER_KEY_SCROLL_LOCK;
+	return modifiers;
+}
+
+static void source_key_click(void *data, const struct obs_key_event *event, bool key_up)
+{
+	struct flutter_source *ctx = data;
+	if (!ctx || !event || InterlockedCompareExchange(&ctx->shutting_down, 0, 0))
+		return;
+	command_t *command = command_create(CMD_KEY_INPUT);
+	if (!command)
+		return;
+	command->target_time_ns = FlutterEngineGetCurrentTime();
+	command->key_input = (flutter_key_input){
+		.timestamp_us = command->target_time_ns / 1000,
+		.scan_code = event->native_scancode ? event->native_scancode
+						    : MapVirtualKeyW(event->native_vkey, MAPVK_VK_TO_VSC_EX),
+		.virtual_key = event->native_vkey,
+		.modifiers = keyboard_modifiers_from_obs(event),
+		.key_up = key_up,
+		.text = duplicate_string(event->text ? event->text : ""),
+	};
+	// OBS's text buffer belongs to the callback and is invalid after it returns.
+	if (!command->key_input.text || !worker_queue_push(&ctx->worker_queue, command, false))
+		command_destroy(command);
 }
 
 struct obs_source_info flutter_source_info = {
@@ -1551,5 +1778,6 @@ struct obs_source_info flutter_source_info = {
 	.mouse_move = source_mouse_move,
 	.mouse_wheel = source_mouse_wheel,
 	.focus = source_focus,
+	.key_click = source_key_click,
 	.icon_type = OBS_ICON_TYPE_MEDIA,
 };

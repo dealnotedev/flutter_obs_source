@@ -52,6 +52,8 @@ set_target_properties(
 add_library(${CMAKE_PROJECT_NAME} MODULE
         src/flutter-source.c
         src/flutter-mouse.c
+        src/flutter-keyboard.c
+        src/flutter-text-input.c
         src/runtime-validation.c)
 
 find_package(libobs REQUIRED)
@@ -198,4 +200,18 @@ if(BUILD_TESTING)
     target_compile_options(mouse_input_tests PRIVATE /W4)
   endif()
   add_test(NAME mouse_input_tests COMMAND mouse_input_tests)
+
+  add_executable(keyboard_input_tests
+          tests/keyboard-input-test.c
+          src/flutter-keyboard.c
+          src/flutter-text-input.c
+          $<TARGET_OBJECTS:cjson_obj>)
+  target_include_directories(keyboard_input_tests PRIVATE
+          "${CMAKE_CURRENT_SOURCE_DIR}/src"
+          "${FLUTTER_ENGINE_DIR}")
+  target_link_libraries(keyboard_input_tests PRIVATE user32)
+  if(MSVC)
+    target_compile_options(keyboard_input_tests PRIVATE /W4)
+  endif()
+  add_test(NAME keyboard_input_tests COMMAND keyboard_input_tests)
 endif()
