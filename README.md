@@ -3,6 +3,17 @@
 Windows OBS Studio source plugin that embeds a Flutter Engine and renders a
 Flutter AOT application as an OBS video/audio source.
 
+OBS's Add Source menu provides two independent types:
+
+- **Freydis Overlay (Software)** uses Flutter's CPU rasterizer. Its existing
+  `flutter_source` ID is preserved, so previously saved scenes keep working.
+- **Freydis Overlay (GPU)** uses Flutter OpenGL ES through ANGLE on the same
+  GPU adapter as OBS. Its ID is `flutter_source_gpu`. It requires OBS's Direct3D
+  11 backend and a GPU supporting D3D feature level 11.0.
+
+Both types use the same application, settings, input handling and audio code,
+and can coexist in a scene. Each instance still owns its own Flutter Engine.
+
 ## Runtime layout
 
 Install the files under the OBS plugin directory with this layout:
@@ -18,11 +29,22 @@ obs-plugins/64bit/
       AssetManifest.bin
       FontManifest.json
       ...
+    angle/                   # Required only for the GPU source
+      libEGL.dll
+      libGLESv2.dll
+      d3dcompiler_47.dll
+      vulkan-1.dll            # Optional Vulkan backend; this source uses D3D11
 ```
 
 The application directory is intentionally named `flutter_obs_source`. The
 plugin resolves it relative to `flutter_obs_source.dll` and refuses to create a
 source when `app.so`, `icudtl.dat`, or `flutter_assets` is missing.
+
+Keep the ANGLE DLLs in the nested `flutter_obs_source/angle` directory; do not
+replace OBS's copies in `obs-plugins/64bit`. The GPU renderer loads its EGL/GLES
+pair by absolute path and resolves functions from those handles. This separates
+the pair from obs-browser's ANGLE. Windows can still reuse common dependencies
+loaded by name, such as `d3dcompiler_47.dll`; this is not a separate DLL namespace.
 
 ## Threading model
 
@@ -33,7 +55,11 @@ platform/UI thread model. Raster and IO threads remain engine-managed.
 Flutter API calls, platform messages, window metrics, lifecycle updates, and
 engine shutdown are serialized through this runner. Rendered software frames
 are transferred through three frame slots so the Flutter raster thread never
-writes a buffer while OBS uploads it.
+writes a buffer while OBS uploads it. GPU frames use three shared D3D11 textures
+and keyed mutexes. Flutter renders on a private device, and OBS copies the newest
+completed frame into its retained display texture. There is no CPU pixel
+readback or upload in the GPU path. GPU waits on the OBS graphics thread are
+nonblocking; the last displayed frame persists while Flutter is idle.
 
 Audio commands and miniaudio state are isolated per source. Audio callbacks are
 prevented from overlapping, and sample timestamps advance on a fixed 48 kHz
@@ -135,6 +161,22 @@ Configure `FLUTTER_ENGINE_DIR` with the matching Flutter Engine release build.
 Set `FLUTTER_APP_BUNDLE_DIR` to a directory containing `app.so`, `icudtl.dat`,
 and `flutter_assets` to create a complete runnable output directory.
 
+Build ANGLE's shared libraries from that engine checkout when not already present:
+
+```powershell
+ninja -C E:/flutter_engine_20206/flutter/engine/src/out/host_release libEGL libGLESv2
+```
+
+`FLUTTER_ANGLE_DIR` defaults to `FLUTTER_ENGINE_DIR`. Set it to the directory
+containing the matching `libEGL.dll`/`libGLESv2.dll` pair when using a separate
+ANGLE build. `FLUTTER_ANGLE_INCLUDE_DIR` defaults to the engine checkout's
+`flutter/third_party/angle/include`. CMake packages ANGLE and its available
+compiler/Vulkan dependencies into `flutter_obs_source/angle`.
+
+ANGLE loads only when a GPU source is created. Missing DLLs produce a GPU
+initialization error in the OBS log; the software source remains available.
+The GPU source does not silently switch to software rendering.
+
 ```powershell
 cmake -G "Visual Studio 17 2022" `
   -S . `
@@ -149,9 +191,58 @@ ctest --test-dir cmake-build-release-visual-studio -C Release --output-on-failur
 If `FLUTTER_APP_BUNDLE_DIR` is omitted, the DLLs are still built, but the
 application runtime is not copied automatically.
 
+When an OBS SDK is already installed, `-DOBS_USE_EXISTING_DEPS=ON` reuses the
+SDK provided through `CMAKE_PREFIX_PATH` without rebuilding OBS on every
+configure. `CMAKE_MSVC_DEBUG_INFORMATION_FORMAT` can be overridden, for example
+with `Embedded` if the installed PDB server is incompatible.
+
+## Renderer verification
+
+The native transfer test loads the plugin into libobs and checks both registered
+source names, pixel colors, orientation, premultiplied transparency, padded
+software rows, resize, dropped frames, concurrent raster/graphics work, the
+shared IO context and shutdown. It runs on a real D3D11 GPU:
+
+```powershell
+cmake -S . -B cmake-build-release-visual-studio `
+  "-DOBS_RENDERER_TEST_BIN=C:/Program Files/obs-studio/bin/64bit" `
+  "-DOBS_RENDERER_TEST_DATA=C:/Program Files/obs-studio/data/libobs"
+cmake --build cmake-build-release-visual-studio --config Release
+ctest --test-dir cmake-build-release-visual-studio -C Release --output-on-failure
+```
+
+Set `OBS_RENDERER_TEST_ANGLE_DIR` to the installed OBS directory containing
+`libEGL.dll` and `libGLESv2.dll` to run the coexistence test. It preloads OBS's
+libraries before creating our renderers, checks that GLES entry points are
+distinct, verifies rendering and shutdown, and checks that the preloaded ANGLE
+resolver remains usable. With the offline fixture configured, it also runs both
+actual Flutter sources in the same process.
+
+Compile the offline Dart fixture with the matching local engine to also verify
+both actual OBS sources together, rendered pixels after resize and shutdown:
+
+```powershell
+Push-Location tests/flutter
+flutter pub get
+flutter --local-engine-src-path=E:/flutter_engine_20206/flutter/engine/src `
+  --local-engine=host_release --local-engine-host=host_release assemble `
+  -o build/renderer_fixture "-dTargetPlatform=windows-x64" "-dBuildMode=release" `
+  "-dTargetFile=lib/renderer_fixture.dart" release_bundle_windows-x64_assets
+Copy-Item build/renderer_fixture/windows/app.so build/renderer_fixture/app.so
+Copy-Item E:/flutter_engine_20206/flutter/engine/src/out/host_release/icudtl.dat build/renderer_fixture/icudtl.dat
+Pop-Location
+cmake -S . -B cmake-build-release-visual-studio `
+  "-DFLUTTER_RENDERER_TEST_BUNDLE=$PWD/tests/flutter/build/renderer_fixture"
+cmake --build cmake-build-release-visual-studio --config Release
+ctest --test-dir cmake-build-release-visual-studio -C Release --output-on-failure
+```
+
+The integration test stages a separate fixture runtime in the build directory;
+it does not run or overwrite the production application bundle.
+
 ## Current limitations
 
-- Rendering uses Flutter's software renderer and uploads a dynamic OBS texture.
+- The software source uploads a dynamic OBS texture.
   This is reliable across OBS graphics backends but remains CPU/bandwidth heavy
   at high resolutions and frame rates.
 - Accessibility, IME composition, and application-controlled system cursor

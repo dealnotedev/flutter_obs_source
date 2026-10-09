@@ -21,4 +21,7 @@ function(_check_dependencies_windows)
   _check_dependencies()
 endfunction()
 
-_check_dependencies_windows()
+option(OBS_USE_EXISTING_DEPS "Use an already installed OBS SDK from CMAKE_PREFIX_PATH" OFF)
+if(NOT OBS_USE_EXISTING_DEPS)
+  _check_dependencies_windows()
+endif()

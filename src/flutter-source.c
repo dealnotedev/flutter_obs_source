@@ -2,8 +2,8 @@
  * OBS Studio source plug-in that embeds the Flutter engine on Windows.
  *
  * Each source owns a dedicated platform/UI event loop. Flutter renders into
- * software frame slots which are handed to the OBS graphics thread without
- * concurrent reads and writes. Audio is mixed independently for every source.
+ * a software or GPU renderer with synchronized frame transfer to OBS.
+ * Engine, input and audio handling are shared by both source types.
  */
 
 #include <math.h>
@@ -25,10 +25,10 @@
 #include "flutter-keyboard.h"
 #include "flutter-text-input.h"
 #include "runtime-validation.h"
+#include "flutter-renderer.h"
 #include "./third_party/cjson/cJSON.h"
 #include "./third_party/miniaudio/miniaudio.h"
 
-#define FRAME_SLOT_COUNT 3
 #define AUDIO_QUEUE_SIZE 128
 #define MAX_SOUNDS FLUTTER_MAX_SOUNDS
 #define AUDIO_FRAMES_PER_TICK 960
@@ -88,23 +88,6 @@ typedef struct {
 } worker_queue_t;
 
 typedef enum {
-	FRAME_SLOT_FREE,
-	FRAME_SLOT_WRITING,
-	FRAME_SLOT_READY,
-	FRAME_SLOT_READING,
-} frame_slot_state;
-
-typedef struct {
-	uint8_t *data;
-	size_t capacity;
-	size_t row_bytes;
-	uint32_t width;
-	uint32_t height;
-	uint64_t generation;
-	frame_slot_state state;
-} frame_slot;
-
-typedef enum {
 	AUDIO_SOUND_EMPTY,
 	AUDIO_SOUND_LOADING,
 	AUDIO_SOUND_READY,
@@ -135,16 +118,11 @@ struct flutter_source {
 	volatile LONG runner_destroyed;
 	bool engine_init_succeeded;
 
-	CRITICAL_SECTION frame_cs;
-	frame_slot frames[FRAME_SLOT_COUNT];
-	int ready_frame;
-	uint64_t frame_generation;
+	CRITICAL_SECTION metrics_cs;
 	uint32_t width;
 	uint32_t height;
 	uint32_t pixel_ratio_pct;
-	gs_texture_t *texture;
-	uint32_t texture_width;
-	uint32_t texture_height;
+	flutter_renderer *renderer;
 
 	CRITICAL_SECTION config_cs;
 	char requested_dart_config[DART_CONFIG_CAPACITY];
@@ -442,74 +420,6 @@ static bool module_asset_paths(char *assets_path, char *icu_path, char *aot_path
 	return true;
 }
 
-static bool surface_present_cb(void *user_data, const void *allocation, size_t row_bytes, size_t height)
-{
-	struct flutter_source *ctx = user_data;
-	if (!ctx || !allocation || InterlockedCompareExchange(&ctx->shutting_down, 0, 0))
-		return false;
-
-	EnterCriticalSection(&ctx->frame_cs);
-	const uint32_t width = ctx->width;
-	const uint32_t expected_height = ctx->height;
-	const uint64_t generation = ctx->frame_generation;
-	size_t required_size = 0;
-	if (height != expected_height || row_bytes < (size_t)width * 4 ||
-	    (height && row_bytes > SIZE_MAX / height) ||
-	    !flutter_checked_frame_size(width, expected_height, &required_size)) {
-		LeaveCriticalSection(&ctx->frame_cs);
-		return true;
-	}
-
-	int slot_index = -1;
-	for (int i = 0; i < FRAME_SLOT_COUNT; ++i) {
-		if (ctx->frames[i].state == FRAME_SLOT_FREE) {
-			slot_index = i;
-			ctx->frames[i].state = FRAME_SLOT_WRITING;
-			break;
-		}
-	}
-	LeaveCriticalSection(&ctx->frame_cs);
-
-	if (slot_index < 0)
-		return true;
-
-	frame_slot *slot = &ctx->frames[slot_index];
-	if (slot->capacity < required_size) {
-		uint8_t *resized = realloc(slot->data, required_size);
-		if (!resized) {
-			blog(LOG_ERROR, "[FlutterSource] Unable to allocate %zu bytes for a Flutter frame", required_size);
-			EnterCriticalSection(&ctx->frame_cs);
-			slot->state = FRAME_SLOT_FREE;
-			LeaveCriticalSection(&ctx->frame_cs);
-			return false;
-		}
-		slot->data = resized;
-		slot->capacity = required_size;
-	}
-
-	const size_t tight_row_bytes = (size_t)width * 4;
-	const uint8_t *source = allocation;
-	for (uint32_t row = 0; row < expected_height; ++row)
-		memcpy(slot->data + row * tight_row_bytes, source + row * row_bytes, tight_row_bytes);
-
-	EnterCriticalSection(&ctx->frame_cs);
-	if (ctx->frame_generation != generation || ctx->width != width || ctx->height != expected_height ||
-	    InterlockedCompareExchange(&ctx->shutting_down, 0, 0)) {
-		slot->state = FRAME_SLOT_FREE;
-	} else {
-		if (ctx->ready_frame >= 0 && ctx->frames[ctx->ready_frame].state == FRAME_SLOT_READY)
-			ctx->frames[ctx->ready_frame].state = FRAME_SLOT_FREE;
-		slot->row_bytes = tight_row_bytes;
-		slot->width = width;
-		slot->height = expected_height;
-		slot->generation = generation;
-		slot->state = FRAME_SLOT_READY;
-		ctx->ready_frame = slot_index;
-	}
-	LeaveCriticalSection(&ctx->frame_cs);
-	return true;
-}
-
 static void log_message_cb(const char *tag, const char *message, void *user_data)
 {
 	(void)user_data;
@@ -536,7 +446,7 @@ static void send_platform_response(struct flutter_source *ctx, const FlutterPlat
 
 static void platform_message_cb(const FlutterPlatformMessage *message, void *user_data)
 {
-	struct flutter_source *ctx = user_data;
+	struct flutter_source *ctx = flutter_renderer_owner(user_data);
 	if (!ctx || !message || !message->channel || !ctx->engine)
 		return;
 
@@ -787,14 +697,7 @@ static bool engine_init(struct flutter_source *ctx)
 		return false;
 	copy_string(ctx->assets_dir, sizeof(ctx->assets_dir), assets, "Flutter assets path");
 
-	const FlutterSoftwareRendererConfig software = {
-		.struct_size = sizeof(software),
-		.surface_present_callback = surface_present_cb,
-	};
-	const FlutterRendererConfig renderer = {
-		.type = kSoftware,
-		.software = software,
-	};
+	const FlutterRendererConfig renderer = flutter_renderer_config(ctx->renderer);
 
 	ctx->platform_runner_desc = (FlutterTaskRunnerDescription){
 		.struct_size = sizeof(FlutterTaskRunnerDescription),
@@ -834,7 +737,7 @@ static bool engine_init(struct flutter_source *ctx)
 	}
 	project.aot_data = ctx->aot_data;
 
-	result = FlutterEngineInitialize(FLUTTER_ENGINE_VERSION, &renderer, &project, ctx, &ctx->engine);
+	result = FlutterEngineInitialize(FLUTTER_ENGINE_VERSION, &renderer, &project, ctx->renderer, &ctx->engine);
 	if (result != kSuccess) {
 		log_flutter_result("FlutterEngineInitialize", result);
 		FlutterEngineCollectAOTData(ctx->aot_data);
@@ -1302,50 +1205,34 @@ static bool enqueue_control_and_wait(struct flutter_source *ctx, command_type_t 
 	return completed;
 }
 
-static void release_frame_resources(struct flutter_source *ctx)
-{
-	obs_enter_graphics();
-	if (ctx->texture)
-		gs_texture_destroy(ctx->texture);
-	ctx->texture = NULL;
-	obs_leave_graphics();
-
-	for (int i = 0; i < FRAME_SLOT_COUNT; ++i) {
-		free(ctx->frames[i].data);
-		ctx->frames[i].data = NULL;
-		ctx->frames[i].capacity = 0;
-	}
-}
-
 static void dispose_source(struct flutter_source *ctx)
 {
 	if (!ctx)
 		return;
 	stop_audio_timer(ctx);
 	uninitialize_audio(ctx);
-	release_frame_resources(ctx);
+	flutter_renderer_destroy(ctx->renderer);
 	worker_queue_destroy(&ctx->worker_queue);
 	DeleteCriticalSection(&ctx->audio_cs);
 	DeleteCriticalSection(&ctx->config_cs);
-	DeleteCriticalSection(&ctx->frame_cs);
+	DeleteCriticalSection(&ctx->metrics_cs);
 	bfree(ctx);
 }
 
 static const char *source_get_name(void *unused)
 {
 	(void)unused;
-	return "Freydis Overlay";
+	return "Freydis Overlay (Software)";
 }
 
-static void *source_create(obs_data_t *settings, obs_source_t *source)
+static void *source_create_with_renderer(obs_data_t *settings, obs_source_t *source,
+					 flutter_renderer_type renderer_type)
 {
 	struct flutter_source *ctx = bzalloc(sizeof(*ctx));
 	if (!ctx)
 		return NULL;
 	ctx->source = source;
-	ctx->ready_frame = -1;
-	ctx->frame_generation = 1;
-	InitializeCriticalSection(&ctx->frame_cs);
+	InitializeCriticalSection(&ctx->metrics_cs);
 	InitializeCriticalSection(&ctx->config_cs);
 	InitializeCriticalSection(&ctx->audio_cs);
 	worker_queue_init(&ctx->worker_queue);
@@ -1364,6 +1251,12 @@ static void *source_create(obs_data_t *settings, obs_source_t *source)
 	copy_string(normalized_config, sizeof(normalized_config), config, "Dart config");
 	copy_string(ctx->requested_dart_config, sizeof(ctx->requested_dart_config), normalized_config, "Dart config");
 	copy_string(ctx->dart_config, sizeof(ctx->dart_config), ctx->requested_dart_config, "Dart config");
+
+	ctx->renderer = flutter_renderer_create(renderer_type, ctx->width, ctx->height, ctx);
+	if (!ctx->renderer) {
+		dispose_source(ctx);
+		return NULL;
+	}
 
 	if (initialize_audio(ctx) &&
 	    !CreateTimerQueueTimer(&ctx->audio_timer, NULL, audio_tick, ctx, 0, 20, WT_EXECUTEDEFAULT)) {
@@ -1414,74 +1307,24 @@ static void source_destroy(void *data)
 static void source_render(void *data, gs_effect_t *effect)
 {
 	struct flutter_source *ctx = data;
-	int slot_index = -1;
-	uint32_t current_width;
-	uint32_t current_height;
-
-	EnterCriticalSection(&ctx->frame_cs);
-	current_width = ctx->width;
-	current_height = ctx->height;
-	if (ctx->ready_frame >= 0 && ctx->frames[ctx->ready_frame].state == FRAME_SLOT_READY) {
-		slot_index = ctx->ready_frame;
-		ctx->frames[slot_index].state = FRAME_SLOT_READING;
-		ctx->ready_frame = -1;
-	}
-	LeaveCriticalSection(&ctx->frame_cs);
-
-	if (slot_index >= 0) {
-		frame_slot *slot = &ctx->frames[slot_index];
-		if (!ctx->texture || ctx->texture_width != slot->width || ctx->texture_height != slot->height) {
-			if (ctx->texture)
-				gs_texture_destroy(ctx->texture);
-			ctx->texture = gs_texture_create(slot->width, slot->height, GS_BGRA, 1, NULL, GS_DYNAMIC);
-			ctx->texture_width = slot->width;
-			ctx->texture_height = slot->height;
-		}
-		if (ctx->texture)
-			gs_texture_set_image(ctx->texture, slot->data, (uint32_t)slot->row_bytes, false);
-
-		EnterCriticalSection(&ctx->frame_cs);
-		slot->state = FRAME_SLOT_FREE;
-		LeaveCriticalSection(&ctx->frame_cs);
-	} else if (ctx->texture &&
-		   (ctx->texture_width != current_width || ctx->texture_height != current_height)) {
-		gs_texture_destroy(ctx->texture);
-		ctx->texture = NULL;
-		ctx->texture_width = 0;
-		ctx->texture_height = 0;
-	}
-
-	if (!ctx->texture || !effect)
-		return;
-
-	const bool srgb_previous = gs_framebuffer_srgb_enabled();
-	gs_enable_framebuffer_srgb(true);
-	gs_blend_state_push();
-	gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
-	gs_eparam_t *image = gs_effect_get_param_by_name(effect, "image");
-	if (image) {
-		gs_effect_set_texture_srgb(image, ctx->texture);
-		gs_draw_sprite(ctx->texture, 0, current_width, current_height);
-	}
-	gs_blend_state_pop();
-	gs_enable_framebuffer_srgb(srgb_previous);
+	flutter_renderer_render(ctx->renderer, effect);
 }
 
 static uint32_t source_get_width(void *data)
 {
 	struct flutter_source *ctx = data;
-	EnterCriticalSection(&ctx->frame_cs);
+	EnterCriticalSection(&ctx->metrics_cs);
 	const uint32_t width = ctx->width;
-	LeaveCriticalSection(&ctx->frame_cs);
+	LeaveCriticalSection(&ctx->metrics_cs);
 	return width;
 }
 
 static uint32_t source_get_height(void *data)
 {
 	struct flutter_source *ctx = data;
-	EnterCriticalSection(&ctx->frame_cs);
+	EnterCriticalSection(&ctx->metrics_cs);
 	const uint32_t height = ctx->height;
-	LeaveCriticalSection(&ctx->frame_cs);
+	LeaveCriticalSection(&ctx->metrics_cs);
 	return height;
 }
 
@@ -1520,18 +1363,15 @@ static void source_update(void *data, obs_data_t *settings)
 	copy_string(normalized_config, sizeof(normalized_config), config, "Dart config");
 
 	bool metrics_changed;
-	EnterCriticalSection(&ctx->frame_cs);
+	EnterCriticalSection(&ctx->metrics_cs);
 	metrics_changed = width != ctx->width || height != ctx->height || pixel_ratio != ctx->pixel_ratio_pct;
 	if (metrics_changed) {
 		ctx->width = width;
 		ctx->height = height;
 		ctx->pixel_ratio_pct = pixel_ratio;
-		++ctx->frame_generation;
-		if (ctx->ready_frame >= 0 && ctx->frames[ctx->ready_frame].state == FRAME_SLOT_READY)
-			ctx->frames[ctx->ready_frame].state = FRAME_SLOT_FREE;
-		ctx->ready_frame = -1;
+		flutter_renderer_resize(ctx->renderer, width, height);
 	}
-	LeaveCriticalSection(&ctx->frame_cs);
+	LeaveCriticalSection(&ctx->metrics_cs);
 
 	bool config_changed;
 	char *config_copy = NULL;
@@ -1759,7 +1599,23 @@ static void source_key_click(void *data, const struct obs_key_event *event, bool
 		command_destroy(command);
 }
 
-struct obs_source_info flutter_source_info = {
+static void *source_create(obs_data_t *settings, obs_source_t *source)
+{
+	return source_create_with_renderer(settings, source, FLUTTER_RENDERER_SOFTWARE);
+}
+
+static void *source_create_gpu(obs_data_t *settings, obs_source_t *source)
+{
+	return source_create_with_renderer(settings, source, FLUTTER_RENDERER_GPU);
+}
+
+static const char *source_get_gpu_name(void *unused)
+{
+	(void)unused;
+	return "Freydis Overlay (GPU)";
+}
+
+static struct obs_source_info flutter_source_info = {
 	.id = "flutter_source",
 	.type = OBS_SOURCE_TYPE_INPUT,
 	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_SRGB | OBS_SOURCE_AUDIO | OBS_SOURCE_INTERACTION,
@@ -1781,3 +1637,13 @@ struct obs_source_info flutter_source_info = {
 	.key_click = source_key_click,
 	.icon_type = OBS_ICON_TYPE_MEDIA,
 };
+
+void register_flutter_sources(void)
+{
+	obs_register_source(&flutter_source_info);
+	struct obs_source_info gpu_source_info = flutter_source_info;
+	gpu_source_info.id = "flutter_source_gpu";
+	gpu_source_info.get_name = source_get_gpu_name;
+	gpu_source_info.create = source_create_gpu;
+	obs_register_source(&gpu_source_info);
+}

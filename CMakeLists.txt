@@ -49,6 +49,11 @@ set_target_properties(
     INTERFACE_INCLUDE_DIRECTORIES "${FLUTTER_ENGINE_DIR}"
 )
 
+add_library(flutter_renderer STATIC
+        src/flutter-renderer.cpp
+        src/flutter-renderer-software.cpp
+        src/flutter-renderer-gpu.cpp)
+
 add_library(${CMAKE_PROJECT_NAME} MODULE
         src/flutter-source.c
         src/flutter-mouse.c
@@ -59,7 +64,40 @@ add_library(${CMAKE_PROJECT_NAME} MODULE
 find_package(libobs REQUIRED)
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs
         Flutter::Engine
+        flutter_renderer
 )
+
+set(FLUTTER_ANGLE_DIR "${FLUTTER_ENGINE_DIR}" CACHE PATH "Directory containing the ANGLE runtime DLLs")
+set(FLUTTER_ANGLE_INCLUDE_DIR "${FLUTTER_ENGINE_DIR}/../../flutter/third_party/angle/include"
+    CACHE PATH "Directory containing the ANGLE EGL and GLES headers")
+if(NOT EXISTS "${FLUTTER_ANGLE_INCLUDE_DIR}/EGL/eglext_angle.h")
+  message(FATAL_ERROR "Set FLUTTER_ANGLE_INCLUDE_DIR to the ANGLE include directory")
+endif()
+target_include_directories(flutter_renderer PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src" "${FLUTTER_ENGINE_DIR}"
+                           PRIVATE "${FLUTTER_ANGLE_INCLUDE_DIR}")
+target_link_libraries(flutter_renderer PUBLIC OBS::libobs PRIVATE d3d11 dxgi)
+target_compile_features(flutter_renderer PRIVATE cxx_std_17)
+if(MSVC)
+  target_compile_options(flutter_renderer PRIVATE /W4 /EHsc)
+endif()
+
+# ANGLE is loaded only by the GPU source, from its own runtime directory.
+foreach(_angle_dll IN ITEMS libEGL.dll libGLESv2.dll d3dcompiler_47.dll vulkan-1.dll)
+  if(EXISTS "${FLUTTER_ANGLE_DIR}/${_angle_dll}")
+    add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
+      COMMAND "${CMAKE_COMMAND}" -E make_directory
+              "$<TARGET_FILE_DIR:${CMAKE_PROJECT_NAME}>/flutter_obs_source/angle"
+              "${CMAKE_CURRENT_BINARY_DIR}/rundir/$<CONFIG>/flutter_obs_source/angle"
+      COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${FLUTTER_ANGLE_DIR}/${_angle_dll}"
+              "$<TARGET_FILE_DIR:${CMAKE_PROJECT_NAME}>/flutter_obs_source/angle"
+      COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${FLUTTER_ANGLE_DIR}/${_angle_dll}"
+              "${CMAKE_CURRENT_BINARY_DIR}/rundir/$<CONFIG>/flutter_obs_source/angle")
+    install(FILES "${FLUTTER_ANGLE_DIR}/${_angle_dll}"
+            DESTINATION "${CMAKE_PROJECT_NAME}/bin/64bit/flutter_obs_source/angle")
+  elseif(_angle_dll MATCHES "^lib(EGL|GLESv2)")
+    message(WARNING "${_angle_dll} is missing; the GPU source needs this ANGLE runtime DLL")
+  endif()
+endforeach()
 
 if(MSVC)
   target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE /W4)
@@ -180,6 +218,59 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(renderer_transfer_tests tests/renderer-transfer-test.cpp)
+  target_link_libraries(renderer_transfer_tests PRIVATE flutter_renderer)
+  add_dependencies(renderer_transfer_tests ${CMAKE_PROJECT_NAME})
+  target_include_directories(renderer_transfer_tests PRIVATE "${FLUTTER_ANGLE_INCLUDE_DIR}")
+  if(MSVC)
+    target_compile_options(renderer_transfer_tests PRIVATE /W4 /EHsc)
+  endif()
+  set(OBS_RENDERER_TEST_BIN "" CACHE PATH "OBS bin/64bit directory for real GPU transfer tests")
+  set(OBS_RENDERER_TEST_DATA "" CACHE PATH "OBS data/libobs directory for real GPU transfer tests")
+  set(OBS_RENDERER_TEST_ANGLE_DIR "" CACHE PATH "Existing OBS ANGLE directory for DLL coexistence tests")
+  if(OBS_RENDERER_TEST_BIN AND OBS_RENDERER_TEST_DATA)
+    add_test(NAME renderer_transfer_tests COMMAND renderer_transfer_tests
+             "${OBS_RENDERER_TEST_BIN}/libobs-d3d11.dll" "${OBS_RENDERER_TEST_DATA}"
+             "$<TARGET_FILE:${CMAKE_PROJECT_NAME}>")
+    set_tests_properties(renderer_transfer_tests PROPERTIES
+      ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${OBS_RENDERER_TEST_BIN}"
+      TIMEOUT 60)
+    set(FLUTTER_RENDERER_TEST_BUNDLE "" CACHE PATH "Offline Flutter AOT fixture bundle for engine raster tests")
+    if(FLUTTER_RENDERER_TEST_BUNDLE)
+      # Exercise source creation with the offline fixture, leaving the production bundle intact.
+      set(_renderer_test_runtime "${CMAKE_CURRENT_BINARY_DIR}/renderer-source-runtime")
+      add_custom_target(renderer_test_runtime ALL
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${_renderer_test_runtime}"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:${CMAKE_PROJECT_NAME}>"
+                "$<TARGET_FILE:Flutter::Engine>" "${_renderer_test_runtime}"
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory "${FLUTTER_RENDERER_TEST_BUNDLE}"
+                "${_renderer_test_runtime}/flutter_obs_source"
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory
+                "$<TARGET_FILE_DIR:${CMAKE_PROJECT_NAME}>/flutter_obs_source/angle"
+                "${_renderer_test_runtime}/flutter_obs_source/angle"
+        DEPENDS ${CMAKE_PROJECT_NAME})
+      add_dependencies(renderer_transfer_tests renderer_test_runtime)
+      add_test(NAME renderer_engine_tests COMMAND renderer_transfer_tests
+               "${OBS_RENDERER_TEST_BIN}/libobs-d3d11.dll" "${OBS_RENDERER_TEST_DATA}"
+               "${_renderer_test_runtime}/flutter_obs_source.dll" --engine)
+      set_tests_properties(renderer_engine_tests PROPERTIES
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${OBS_RENDERER_TEST_BIN}" TIMEOUT 60)
+    endif()
+    if(OBS_RENDERER_TEST_ANGLE_DIR)
+      set(_coexistence_plugin "$<TARGET_FILE:${CMAKE_PROJECT_NAME}>")
+      set(_coexistence_engine_args)
+      if(FLUTTER_RENDERER_TEST_BUNDLE)
+        set(_coexistence_plugin "${_renderer_test_runtime}/flutter_obs_source.dll")
+        set(_coexistence_engine_args --engine)
+      endif()
+      add_test(NAME renderer_angle_coexistence_tests COMMAND renderer_transfer_tests
+               "${OBS_RENDERER_TEST_BIN}/libobs-d3d11.dll" "${OBS_RENDERER_TEST_DATA}"
+               "${_coexistence_plugin}" ${_coexistence_engine_args}
+               --preload-angle "${OBS_RENDERER_TEST_ANGLE_DIR}")
+      set_tests_properties(renderer_angle_coexistence_tests PROPERTIES
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${OBS_RENDERER_TEST_BIN}" TIMEOUT 60)
+    endif()
+  endif()
   add_executable(runtime_validation_tests
           tests/runtime-validation-test.c
           src/runtime-validation.c
