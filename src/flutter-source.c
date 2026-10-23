@@ -714,12 +714,15 @@ static bool engine_init(struct flutter_source *ctx)
 	};
 
 	static const char *arguments[] = {"obs_flutter"};
+	const char *entrypoint_arguments[] = {obs_source_get_uuid(ctx->source)};
 	FlutterProjectArgs project = {
 		.struct_size = sizeof(project),
 		.assets_path = assets,
 		.icu_data_path = icu,
 		.command_line_argc = (int)(sizeof(arguments) / sizeof(arguments[0])),
 		.command_line_argv = arguments,
+		.dart_entrypoint_argc = (int)(sizeof(entrypoint_arguments) / sizeof(entrypoint_arguments[0])),
+		.dart_entrypoint_argv = entrypoint_arguments,
 		.log_message_callback = log_message_cb,
 		.platform_message_callback = platform_message_cb,
 		.custom_task_runners = &ctx->custom_runners,

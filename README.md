@@ -100,6 +100,31 @@ Interaction is intentionally limited to the Interact window. Clicking or
 dragging the source directly in the main OBS preview still manipulates the OBS
 scene rather than the Flutter application.
 
+## Dart entrypoint arguments
+
+Both source types pass the OBS source instance's UUID as the only argument to
+the Dart entrypoint:
+
+```dart
+void main(List<String> args) async {
+  WidgetsFlutterBinding.ensureInitialized();
+  final sourceId = args.single;
+  runApp(MyApp(sourceId: sourceId));
+}
+```
+
+The value comes from
+[`obs_source_get_uuid()`](https://docs.obsproject.com/reference-sources#c.obs_source_get_uuid).
+It remains the same when the source is renamed and when its saved scene
+collection is reloaded, including after restarting OBS. A new or duplicated
+source receives a new UUID. Referencing the same source in multiple scenes
+shares its UUID and Flutter Engine. OBS may regenerate UUIDs when duplicating
+an entire scene collection.
+
+The argument is available before Flutter bindings or platform channels are
+initialized. Entry point arguments use `FlutterProjectArgs.dart_entrypoint_argv`;
+`command_line_argv` configures the engine itself.
+
 ## Dart channels
 
 The native side uses raw UTF-8 strings. Use `BasicMessageChannel<String>` with
@@ -219,7 +244,8 @@ resolver remains usable. With the offline fixture configured, it also runs both
 actual Flutter sources in the same process.
 
 Compile the offline Dart fixture with the matching local engine to also verify
-both actual OBS sources together, rendered pixels after resize and shutdown:
+both actual OBS sources together, Dart entrypoint UUIDs, identity after rename
+and save/load, rendered pixels after resize and shutdown:
 
 ```powershell
 Push-Location tests/flutter

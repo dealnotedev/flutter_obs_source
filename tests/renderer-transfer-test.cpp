@@ -117,33 +117,58 @@ static bool capture(flutter_renderer *renderer, uint32_t width, uint32_t height,
 	return correct;
 }
 
+static void require_source_frame(obs_source_t *source, uint32_t width, uint32_t height)
+{
+	bool correct = false;
+	for (int i = 0; i < 500 && !correct; ++i) {
+		correct = capture(nullptr, width, height, true, source);
+		if (!correct)
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+	require(correct, "registered source renders Flutter with its OBS UUID in main(args)");
+}
+
 static void test_sources()
 {
 	auto *settings = obs_data_create();
-	obs_data_set_int(settings, "width", 320);
-	obs_data_set_int(settings, "height", 240);
-	auto *software = obs_source_create("flutter_source", "Software fixture", settings, nullptr);
-	auto *gpu = obs_source_create("flutter_source_gpu", "GPU fixture", settings, nullptr);
+	auto *software = obs_source_create("flutter_source", "Software fixture", nullptr, nullptr);
+	auto *gpu = obs_source_create("flutter_source_gpu", "GPU fixture", nullptr, nullptr);
 	require(software && gpu, "create both registered sources simultaneously");
+	require(std::string(obs_source_get_uuid(software)) != obs_source_get_uuid(gpu), "source instances have distinct UUIDs");
 	for (const auto size : {std::pair<uint32_t, uint32_t>{320, 240}, {640, 480}, {320, 240}}) {
 		const auto [width, height] = size;
 		obs_data_set_int(settings, "width", width);
 		obs_data_set_int(settings, "height", height);
 		for (auto *source : {software, gpu}) {
+			const std::string config =
+				std::string("{\"expected_source_uuid\":\"") + obs_source_get_uuid(source) + "\"}";
+			obs_data_set_string(settings, "dart_config", config.c_str());
 			obs_source_update(source, settings);
-			bool correct = false;
-			for (int i = 0; i < 500 && !correct; ++i) {
-				correct = capture(nullptr, width, height, true, source);
-				if (!correct)
-					std::this_thread::sleep_for(std::chrono::milliseconds(10));
-			}
-			require(correct, "registered source renders real Flutter after update");
+			require_source_frame(source, width, height);
 		}
 	}
-	obs_source_release(gpu);
-	obs_source_release(software);
+	for (auto *source : {software, gpu}) {
+		const std::string uuid = obs_source_get_uuid(source);
+		require(!uuid.empty(), "source UUID is nonempty");
+		const std::string renamed = std::string(obs_source_get_name(source)) + " renamed";
+		obs_source_set_name(source, renamed.c_str());
+		require(uuid == obs_source_get_uuid(source), "renaming preserves the source UUID");
+		auto *saved = obs_save_source(source);
+		auto *persisted = obs_data_create_from_json(obs_data_get_json(saved));
+		require(persisted != nullptr, "serialize source identity and settings");
+		obs_data_release(saved);
+		obs_source_release(source);
+		obs_queue_task(OBS_TASK_DESTROY, [](void *) {}, nullptr, true);
+		auto *loaded = obs_load_source(persisted);
+		require(loaded != nullptr && uuid == obs_source_get_uuid(loaded), "save/load preserves the source UUID");
+		require_source_frame(loaded, 320, 240);
+		obs_source_release(loaded);
+		obs_queue_task(OBS_TASK_DESTROY, [](void *) {}, nullptr, true);
+		obs_data_release(persisted);
+	}
 	obs_data_release(settings);
-	printf("PASS: both OBS sources coexist, exchange config messages, render, resize and shut down\n");
+	printf("PASS: both OBS sources receive their UUID in main(args), preserve it after rename/save/load, "
+	       "coexist, exchange config messages, render, resize and shut down\n");
 }
 
 static void test_renderer(flutter_renderer_type type)

@@ -4,9 +4,25 @@ import 'dart:typed_data';
 
 // Offline AOT fixture: exercises the real Flutter rasterizer without networking,
 // plugins, or the production application's state.
-void main() {
+void main(List<String> args) async {
   final dispatcher = ui.PlatformDispatcher.instance;
   var configured = false;
+  void configure(ByteData? data) {
+    if (data == null) return;
+    final message = utf8.decode(
+      data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
+    );
+    final config = jsonDecode(message) as Map<String, dynamic>;
+    final expectedSourceId = config['expected_source_uuid'];
+    if (expectedSourceId == null) return;
+    configured = args.length == 1 && args.single == expectedSourceId;
+    dispatcher.scheduleFrame();
+  }
+
+  dispatcher.onPlatformMessage = (channel, data, reply) {
+    if (channel == 'obs_config') configure(data);
+    reply?.call(null);
+  };
   dispatcher.onBeginFrame = (_) {
     if (!configured) return;
     final view = dispatcher.implicitView!;
@@ -35,19 +51,9 @@ void main() {
   };
   dispatcher.onMetricsChanged = dispatcher.scheduleFrame;
   final request = Uint8List.fromList(utf8.encode('get_dart_config'));
-  dispatcher.sendPlatformMessage('obs_config', ByteData.sublistView(request), (
-    reply,
-  ) {
-    if (reply != null &&
-        utf8.decode(
-              reply.buffer.asUint8List(
-                reply.offsetInBytes,
-                reply.lengthInBytes,
-              ),
-            ) ==
-            '{}') {
-      configured = true;
-      dispatcher.scheduleFrame();
-    }
-  });
+  dispatcher.sendPlatformMessage(
+    'obs_config',
+    ByteData.sublistView(request),
+    configure,
+  );
 }
